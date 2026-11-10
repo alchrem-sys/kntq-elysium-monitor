@@ -75,7 +75,7 @@ class FakeHttp:
             d = kw.get("data") or {}
             if "validate" in url:
                 return R({"status": 1, "devices": ["iphone"]})
-            print(f"    >>> PUSHOVER [{d.get('priority')}] {d.get('title')} | {d.get('message')}"
+            print(f"    >>> PUSHOVER to …{d.get('user','')[-4:]} [{d.get('priority')}] {d.get('title')} | {d.get('message')}"
                   f" | url={d.get('url_title')}")
             return R({"status": 1})
         return R({}, 404)
@@ -161,9 +161,19 @@ async def main() -> None:
     M._push = Pushover(cfg.pushover_app_token, http, store)
     cmds = CommandServer(cfg, http, markets, store, rt, tg, snapshot, M._push)
 
-    print('### 0. /pushover USER_KEY -> validated, message deleted')
-    await cmds._cmd_pushover('uQiRzpo4DXghDmr9QzzfQu27cmVRsG', {'chat': {'id': -100}, 'message_id': 42})
-    await cmds._cmd_pushover('test', {})
+    me = {'from': {'id': 868931721, 'first_name': 'Lyosha'}, 'chat': {'id': -100}, 'message_id': 41}
+    friend = {'from': {'id': 555000111, 'first_name': 'Friend'}, 'chat': {'id': -100}, 'message_id': 42}
+    print('### 0a. friend tries a command before access -> ignored')
+    await cmds._dispatch('/only 2', friend)
+    print('    only armed?', store.get('only').get('pct'))
+    print('### 0b. owner replies /allow to friend')
+    await cmds._dispatch('/allow', {**me, 'reply_to_message': friend})
+    print('### 0c. both connect their own Pushover keys')
+    await cmds._dispatch('/pushover uLyoshaKey000000000000000000AAAA', me)
+    await cmds._dispatch('/pushover uFriendKey000000000000000000BBBB', {**friend, 'message_id': 43})
+    print('### 0d. friend can now change things; /pushover test reaches both')
+    await cmds._dispatch('/pushover test', friend)
+    await cmds._dispatch('/myid', friend)
 
     print("### 1. Quiet spread -> silence")
     await tick(cfg, rt, core, markets, store, tg, 1)

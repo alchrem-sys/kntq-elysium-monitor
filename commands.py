@@ -27,6 +27,8 @@ STATUS_RE = re.compile(r"^/status(?:@\S+)?\s*$", re.I)
 TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
 TEST_RE = re.compile(r"^/test(?:@\S+)?\s*$", re.I)
 PUSHOVER_RE = re.compile(r"^/pushover(?:@\S+)?(?:\s+(\S+))?\s*$", re.I)
+ALLOW_RE = re.compile(r"^/(allow|deny)(?:@\S+)?(?:\s+(\d+))?\s*$", re.I)
+MYID_RE = re.compile(r"^/myid(?:@\S+)?\s*$", re.I)
 ONLY_RE = re.compile(r"^/only(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 
 # Ladder used to measure how much a route can absorb before it stops clearing
@@ -63,10 +65,17 @@ class CommandServer:
         self._offset: int | None = None
         self._base = f"https://api.telegram.org/bot{cfg.telegram_token}"
 
+    def _allowed(self) -> set[str]:
+        return set(self.cfg.telegram_admin_ids) | set(self.store.get("access").get("ids") or [])
+
+    def _is_owner(self, msg: dict) -> bool:
+        uid = str((msg.get("from") or {}).get("id"))
+        return not self.cfg.telegram_admin_ids or uid in self.cfg.telegram_admin_ids
+
     def _is_admin(self, msg: dict) -> bool:
-        if not self.cfg.telegram_admin_id:
+        if not self.cfg.telegram_admin_ids:
             return True  # no admin configured: the bot is already private
-        return str((msg.get("from") or {}).get("id")) == self.cfg.telegram_admin_id
+        return str((msg.get("from") or {}).get("id")) in self._allowed()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -114,6 +123,13 @@ class CommandServer:
             if not self._is_admin(msg):
                 return
             await self._cmd_test()
+        elif MYID_RE.match(text):
+            u = msg.get("from") or {}
+            await self.tg.send(f"{u.get('first_name', '')}: <code>{u.get('id')}</code>")
+        elif m := ALLOW_RE.match(text):
+            if not self._is_owner(msg):
+                return
+            await self._cmd_allow(m.group(1).lower(), m.group(2), msg)
         elif m := PUSHOVER_RE.match(text):
             if not self._is_admin(msg):
                 return
@@ -153,25 +169,29 @@ class CommandServer:
         if po is None:
             await self.tg.send("Pushover не підключено в цій збірці.")
             return
+        uid = str((msg.get("from") or {}).get("id"))
+        name = (msg.get("from") or {}).get("first_name") or uid
         if not value:
-            key = po.user_key
+            users = po.users()
+            who = ", ".join(f"…{k[-4:]}" for k in users.values()) or "<b>нікого</b>"
             await self.tg.send(
-                f"Pushover: app token {'є' if po.app_token else '<b>немає</b> (PUSHOVER_APP_TOKEN)'}, "
-                f"user key {'задано …' + key[-4:] if key else '<b>не задано</b>'}\n"
+                f"Pushover: app token {'є' if po.app_token else '<b>немає</b> (PUSHOVER_APP_TOKEN)'}\n"
+                f"Підключено: {who}\n"
+                f"Кожен підключає свій ключ сам.\n"
                 f"<code>/pushover USER_KEY</code> — задати · "
                 f"<code>/pushover test</code> — перевірити · "
                 f"<code>/pushover off</code> — вимкнути")
             return
         low = value.lower()
         if low == "off":
-            self.store.update("pushover", user=None)
-            await self.tg.send("🔕 Pushover вимкнено.")
+            po.set_user(uid, None)
+            await self.tg.send(f"🔕 Pushover для {name} вимкнено.")
             return
         if low == "test":
             if not po.ready:
                 await self.tg.send("Спочатку задай ключ: <code>/pushover USER_KEY</code>")
                 return
-            ok = await po.send("KNTQ monitor", "Тестовий пуш — усе працює ✅", priority=0)
+            ok = await po.send("KNTQ monitor", f"Тестовий пуш від {name} — усе працює ✅", priority=0)
             await self.tg.send("✅ Пуш відправлено" if ok else "❌ Pushover відхилив запит, глянь логи")
             return
         deleted = await self._delete(msg)
@@ -179,12 +199,31 @@ class CommandServer:
         if not ok:
             await self.tg.send(f"❌ Ключ не прийнято: {info}")
             return
-        self.store.update("pushover", user=value)
-        await po.send("KNTQ monitor", "Pushover підключено ✅", priority=0)
+        po.set_user(uid, value)
+        await po.send("KNTQ monitor", "Pushover підключено ✅", priority=0, only=uid)
         await self.tg.send(
-            f"✅ Pushover підключено, ключ …{value[-4:]}, пристрої: {info}\n"
+            f"✅ {name}: Pushover підключено, ключ …{value[-4:]}, пристрої: {info}\n"
             + ("Повідомлення з ключем видалив." if deleted
                else "⚠️ Не зміг видалити повідомлення з ключем — видали його сам, група публічна."))
+
+    async def _cmd_allow(self, action: str, value: str | None, msg: dict) -> None:
+        """Owner grants or revokes command access. Reply to a message, or pass an id."""
+        target = (msg.get("reply_to_message") or {}).get("from") or {}
+        tid = value or (str(target["id"]) if target.get("id") else None)
+        if not tid:
+            await self.tg.send("Відповідай командою на повідомлення друга, "
+                               "або <code>/allow ID</code> (ID дає <code>/myid</code>).")
+            return
+        ids = set(self.store.get("access").get("ids") or [])
+        label = target.get("first_name") or tid
+        if action == "allow":
+            ids.add(tid)
+            text = f"✅ {label} (<code>{tid}</code>) тепер може керувати ботом."
+        else:
+            ids.discard(tid)
+            text = f"🚫 {label} (<code>{tid}</code>) більше не керує ботом."
+        self.store.update("access", ids=sorted(ids))
+        await self.tg.send(text)
 
     async def _cmd_only(self, value: str | None) -> None:
         """Watch the spread and nothing else.

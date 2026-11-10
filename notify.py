@@ -58,13 +58,25 @@ class Pushover:
         self.http = http
         self.store = store
 
-    @property
-    def user_key(self) -> str | None:
-        return self.store.get("pushover").get("user")
+    def users(self) -> dict[str, str]:
+        """Telegram user id -> Pushover user key, one per person in the group."""
+        rec = self.store.get("pushover")
+        users = dict(rec.get("users") or {})
+        if rec.get("user"):            # single key saved by the previous build
+            users.setdefault("legacy", rec["user"])
+        return users
+
+    def set_user(self, tg_id: str, key: str | None) -> None:
+        users = {k: v for k, v in self.users().items() if k != "legacy"}
+        if key:
+            users[tg_id] = key
+        else:
+            users.pop(tg_id, None)
+        self.store.update("pushover", users=users, user=None)
 
     @property
     def ready(self) -> bool:
-        return bool(self.app_token and self.user_key)
+        return bool(self.app_token and self.users())
 
     async def validate(self, user_key: str) -> tuple[bool, str]:
         if not self.app_token:
@@ -80,10 +92,21 @@ class Pushover:
         return False, "; ".join(j.get("errors") or ["невідома помилка"])
 
     async def send(self, title: str, message: str, priority: int = 1,
-                   url: str | None = None, url_title: str | None = None) -> bool:
-        if not self.ready:
+                   url: str | None = None, url_title: str | None = None,
+                   only: str | None = None) -> bool:
+        """Push to every connected person, or just `only` (a Telegram id)."""
+        if not self.app_token:
             return False
-        data = {"token": self.app_token, "user": self.user_key, "title": title,
+        users = self.users()
+        if only is not None:
+            users = {k: v for k, v in users.items() if k == only}
+        results = [await self._send_one(key, title, message, priority, url, url_title)
+                   for key in users.values()]
+        return bool(results) and all(results)
+
+    async def _send_one(self, user_key: str, title: str, message: str, priority: int,
+                        url: str | None, url_title: str | None) -> bool:
+        data = {"token": self.app_token, "user": user_key, "title": title,
                 "message": message, "priority": priority, "html": 1}
         if url:
             data["url"] = url

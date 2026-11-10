@@ -175,7 +175,7 @@ def _chains(name: str, default: list[int]) -> list[int]:
 class Config:
     telegram_token: str
     telegram_chat_id: str
-    telegram_admin_id: str
+    telegram_admin_ids: frozenset[str]
     pushover_app_token: str
     redis_url: str
     lifi_api_key: str
@@ -218,7 +218,9 @@ def load() -> Config:
     return Config(
         telegram_token=_req("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_req("TELEGRAM_CHAT_ID"),
-        telegram_admin_id=os.getenv("TELEGRAM_ADMIN_ID", "").strip(),
+        telegram_admin_ids=frozenset(
+            x.strip() for x in os.getenv("TELEGRAM_ADMIN_ID", "").split(",") if x.strip()
+        ),
         pushover_app_token=os.getenv("PUSHOVER_APP_TOKEN", "").strip(),
         redis_url=_req("REDIS_URL"),
         lifi_api_key=os.getenv("LIFI_API_KEY", "").strip(),
