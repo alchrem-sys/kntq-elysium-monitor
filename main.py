@@ -68,6 +68,9 @@ log = logging.getLogger("monitor")
 _stop = asyncio.Event()
 _snapshot: dict = {}
 
+# /only re-fires once the spread climbs this much above where it last fired.
+ESCALATION_PCT = 1.0
+
 
 def snapshot() -> dict:
     return _snapshot
@@ -217,6 +220,35 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
 
     spread = 100.0 * (sell_used / fill.cost_usd - 1.0)
     store.update("spread", last_pct=round(spread, 3))
+
+    # --- /only: spread watch, fired before any exit probing so the push is
+    # immediate. Needs no exit, so it costs nothing against the LI.FI budget.
+    only = store.get("only")
+    only_pct = only.get("pct")
+    if only_pct:
+        # Fire on crossing the threshold, and again whenever the spread climbs
+        # another ESCALATION_PCT above wherever it last fired -- otherwise a
+        # move from 2% to 5% would pass in silence.
+        fired_at = only.get("fired_at")
+        due = spread >= only_pct and (
+            not only.get("fired") or
+            (fired_at is not None and spread >= fired_at + ESCALATION_PCT)
+        )
+        if due:
+            store.update("only", fired=True, fired_at=round(spread, 3))
+            await tg.send("/gm")
+            await tg.send(
+                f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
+                f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
+                f"${cfg.notional_usd:,.0f} → {fill.qty:,.0f} KNTQ → "
+                f"<b>{sell_used:,.2f} USDC</b> на Elysium\n"
+                f"Валом {cfg.notional_usd * spread / 100:+,.0f}$ до вартості виходу.",
+                alert_buttons(None, sell_used),
+            )
+            log.info("ONLY alert sent at %+.2f%%", spread)
+        elif only.get("fired") and spread < (only_pct - cfg.clear_margin_pct):
+            store.update("only", fired=False, fired_at=None)
+            log.info("ONLY re-armed at %+.2f%%", spread)
 
     threshold = rt.go_spread_pct
     tell = store.get("tell")
@@ -383,7 +415,8 @@ async def run() -> int:
             f"▶️ <b>Монітор KNTQ Elysium</b>  v{VERSION}\n"
             f"Коло: ${cfg.notional_usd:,.0f} · мереж: {len(cfg.chains)}\n"
             f"Поріг: {rt.go_spread_pct:.2f}% · вихід ≤{cfg.max_exit_loss_pct:.2f}%\n\n"
-            f"<code>/spread 2.5%</code> — поріг\n"
+            f"<code>/only 2</code> — стежити лише за спредом, шле /gm\n"
+            f"<code>/spread 2.5%</code> — поріг для алерта з виходом\n"
             f"<code>/tell</code> — сповістити, коли з'явиться пул на "
             f"${cfg.notional_usd:,.0f}\n"
             f"<code>/pulls</code> — де зараз можна вийти, з глибиною\n"

@@ -165,6 +165,31 @@ async def main() -> None:
     store.data["go"]["armed"] = False
     await tick(cfg, rt, core, markets, store, tg, 3)
 
+    print("\n### 6. /only 2 -- spread watch, no exit needed")
+    await cmds._cmd_only("2")
+
+    print("\n### 7. spread above 2% -> /gm first, then the numbers")
+    store.data["go"]["armed"] = True          # mute GO so only /only speaks
+    lifi_before = markets.lifi_requests
+    await tick(cfg, rt, core, markets, store, tg, 4)
+
+    print("\n### 8. still above -> must stay silent")
+    await tick(cfg, rt, core, markets, store, tg, 5)
+
+    print("\n### 9. spread climbs another 1%+ -> must fire again (escalation)")
+    W["mult"] = 1.045
+    await tick(cfg, rt, core, markets, store, tg, 6)
+
+    print("\n### 9b. spread falls below the band, then back up -> fires again")
+    W["mult"] = 1.0
+    await tick(cfg, rt, core, markets, store, tg, 7)
+    W["mult"] = 1.03
+    await tick(cfg, rt, core, markets, store, tg, 8)
+
+    print("\n### 10. /only off")
+    await cmds._cmd_only("off")
+    await tick(cfg, rt, core, markets, store, tg, 8)
+
     print(f"\nTelegram payloads: {len(http.sent)}  LI.FI requests: {markets.lifi_requests}")
 
 

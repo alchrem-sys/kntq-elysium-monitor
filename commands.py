@@ -26,6 +26,7 @@ PULLS_RE = re.compile(r"^/pulls(?:@\S+)?\s*$", re.I)
 STATUS_RE = re.compile(r"^/status(?:@\S+)?\s*$", re.I)
 TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
 TEST_RE = re.compile(r"^/test(?:@\S+)?\s*$", re.I)
+ONLY_RE = re.compile(r"^/only(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 
 # Ladder used to measure how much a route can absorb before it stops clearing
 # the threshold. The cost curve is a cliff, not a slope, so a handful of rungs
@@ -111,6 +112,10 @@ class CommandServer:
             if not self._is_admin(msg):
                 return
             await self._cmd_test()
+        elif m := ONLY_RE.match(text):
+            if not self._is_admin(msg):
+                return
+            await self._cmd_only(m.group(1))
         elif STATUS_RE.match(text):
             await self._cmd_status()
 
@@ -125,6 +130,37 @@ class CommandServer:
             f"Прилетить одне повідомлення, щойно такий з'явиться: мережа, "
             f"маршрут, ціна і скільки він тримає.\n"
             f"Потім зніметься сам — викличеш <code>/tell</code> ще раз, якщо треба."
+        )
+
+    async def _cmd_only(self, value: str | None) -> None:
+        """Watch the spread and nothing else.
+
+        Costs no LI.FI quota: the exit sweep is skipped entirely while this is
+        the only thing armed, because the alert does not depend on an exit.
+        """
+        current = self.store.get("only").get("pct")
+        if value is None:
+            state = f"<b>{current:.2f}%</b>" if current else "вимкнено"
+            await self.tg.send(
+                f"Стеження за спредом: {state}\n"
+                f"Увімкнути: <code>/only 2</code> · вимкнути: <code>/only off</code>"
+            )
+            return
+        if value.lower() == "off":
+            self.store.update("only", pct=None, fired=False)
+            await self.tg.send("🔕 Стеження за спредом вимкнено.")
+            return
+        pct = float(value)
+        if not 0.1 <= pct <= 50:
+            await self.tg.send("Поріг має бути між 0.1% і 50%.")
+            return
+        self.store.update("only", pct=pct, fired=False)
+        await self.tg.send(
+            f"👁 Стежу за спредом вище <b>{pct:.2f}%</b>.\n"
+            f"Коли перевалить — прилетить <code>/gm</code>, "
+            f"а наступним повідомленням цифри.\n"
+            f"Далі мовчу, поки спред не впаде нижче "
+            f"{max(0.0, pct - self.cfg.clear_margin_pct):.2f}% і не підніметься знову."
         )
 
     async def _cmd_test(self) -> None:
