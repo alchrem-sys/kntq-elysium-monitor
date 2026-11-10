@@ -45,6 +45,10 @@ class Store:
             current.update(changed)
             self._dirty = True
 
+    def touch(self) -> None:
+        """Mark state dirty after mutating a nested structure in place."""
+        self._dirty = True
+
     def in_cooldown(self, field: str, seconds: float) -> bool:
         last = self.get(field).get("last_alert_ts") or 0.0
         return (time.time() - last) < seconds

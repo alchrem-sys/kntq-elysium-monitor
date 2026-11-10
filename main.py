@@ -14,6 +14,11 @@ by whether that solver still holds inventory on a given chain, which makes it a
 cliff rather than a depth curve: around 0.3% while inventory lasts, then ~3% at
 every size once it is gone. Splitting the order does not help.
 
+38 chains are watched, but they are never all quoted at once -- LI.FI's rate
+limit does not allow it. Chains are probed cheapest-known-first and the sweep
+stops as soon as enough open exits are found, so the common case costs one or
+two requests and the whole list still gets covered as readings go stale.
+
 Two alerts:
   GO      spread >= GO_SPREAD_PCT and some chain can take the money back out
           at <= MAX_EXIT_LOSS_PCT. Reports the net, not the gross.
@@ -32,13 +37,13 @@ import time
 import httpx
 
 import config
-from config import CHAIN_NAMES, Config, HYPERCORE_KNTQ_USDC
+from config import CHAIN_NAMES, SEED_PRIORITY, Config, HYPERCORE_KNTQ_USDC
 from hyperliquid import HyperCore
 from markets import Exit, Markets, RateLimited
 from notify import Telegram
 from state import Store
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +53,6 @@ logging.basicConfig(
 log = logging.getLogger("monitor")
 
 _stop = asyncio.Event()
-BACKGROUND_EXIT_EVERY = 10  # ticks between exit probes while the spread is quiet
 
 
 def _request_stop(*_args) -> None:
@@ -60,34 +64,80 @@ def _pct(v: float) -> str:
     return f"{v:+.2f}%"
 
 
-async def probe_exits(
-    cfg: Config, markets: Markets, amount_usd: float, chains: list[int]
+def exit_order(cfg: Config, store: Store, now: float) -> list[int]:
+    """Chains ordered by how likely they are to be open right now.
+
+    Known-cheap and fresh first, then anything unmeasured or stale, then the
+    chains last seen drained. One request usually lands on a working exit.
+    """
+    seen = store.get("chains")
+    scored: list[tuple[tuple[int, float], int]] = []
+    for cid in cfg.chains:
+        rec = seen.get(str(cid)) or {}
+        loss = rec.get("loss")
+        age = now - (rec.get("ts") or 0.0)
+        seed_rank = SEED_PRIORITY.index(cid) if cid in SEED_PRIORITY else 99.0
+        if loss is None or age > cfg.stale_seconds:
+            key = (1, seed_rank)
+        elif loss <= cfg.max_exit_loss_pct:
+            key = (0, loss)
+        else:
+            key = (2, loss)
+        scored.append((key, cid))
+    scored.sort()
+    return [cid for _, cid in scored]
+
+
+async def sweep_exits(
+    cfg: Config, markets: Markets, store: Store,
+    amount_usd: float, budget: int, want_open: int,
 ) -> list[Exit]:
+    """Probe chains in priority order until `want_open` usable exits are found."""
     found: list[Exit] = []
-    for chain_id in chains:
-        if _stop.is_set():
+    opened = 0
+    probed = 0
+    for chain_id in exit_order(cfg, store, time.time()):
+        if _stop.is_set() or probed >= budget or opened >= want_open:
             break
         await asyncio.sleep(cfg.spacing_seconds)
+        probed += 1
         try:
             quote = await markets.exit_quote(chain_id, amount_usd)
         except RateLimited as exc:
-            log.warning("LI.FI rate limited (%s); stopping exit probes this tick", str(exc)[:100])
+            log.warning("LI.FI rate limited (%s); ending sweep", str(exc)[:100])
             break
         except Exception as exc:  # noqa: BLE001 - one bad chain must not kill the tick
-            log.warning("Exit probe for %s failed: %s", CHAIN_NAMES.get(chain_id, chain_id), exc)
+            log.warning("Exit probe %s failed: %s", CHAIN_NAMES.get(chain_id, chain_id), exc)
             continue
-        if quote:
-            found.append(quote)
+        if quote is None:
+            # No route at all. Park it at the back of the queue for a while.
+            store.get("chains")[str(chain_id)] = {"loss": 99.0, "ts": time.time()}
+            store.touch()
+            continue
+        store.get("chains")[str(chain_id)] = {
+            "loss": round(quote.loss_pct, 3), "ts": time.time()
+        }
+        store.touch()
+        found.append(quote)
+        if quote.loss_pct <= cfg.max_exit_loss_pct:
+            opened += 1
+    log.info("sweep: probed %d chain(s), %d open", probed, opened)
     return found
 
 
-def go_message(cfg: Config, buy_px: float, qty: float, proceeds: float,
-               spread: float, best: Exit, net_pct: float, depth: float) -> str:
+def go_message(cfg: Config, fill_px: float, qty: float, proceeds: float,
+               spread: float, opens: list[Exit], net_pct: float, depth: float) -> str:
+    best = opens[0]
     net_usd = cfg.notional_usd * net_pct / 100.0
+    alt = ""
+    if len(opens) > 1:
+        alt = "\n    ще: " + ", ".join(
+            f"{e.chain} −{e.loss_pct:.2f}%" for e in opens[1:4]
+        )
     return (
         f"🟢 <b>КОЛО ВІДКРИТЕ</b>  нетто {_pct(net_pct)}  (~${net_usd:,.0f})\n\n"
         f"<b>1. Купівля</b> HyperCore KNTQ/USDC\n"
-        f"    ${cfg.notional_usd:,.0f} → {qty:,.0f} KNTQ @ {buy_px:.5f}\n"
+        f"    ${cfg.notional_usd:,.0f} → {qty:,.0f} KNTQ @ {fill_px:.5f}\n"
         f"    глибина асків ${depth:,.0f}\n"
         f"<b>2. Міст</b> на Elysium 1:1, канонічний, секунди\n"
         f"<b>3. Продаж</b> на Elysium → {proceeds:,.2f} USDC\n"
@@ -95,19 +145,18 @@ def go_message(cfg: Config, buy_px: float, qty: float, proceeds: float,
         f"<b>4. Вихід</b> → {best.chain}\n"
         f"    {best.usdc_out:,.2f} USDC, мінус {best.loss_pct:.2f}%\n"
         f"    <code>{best.provider}</code> · ~{best.seconds}с\n"
-        f"    гірший випадок {best.worst_loss_pct:.2f}%"
+        f"    гірший випадок {best.worst_loss_pct:.2f}%{alt}"
     )
 
 
 def urgent_message(cfg: Config, spread: float, proceeds: float,
-                   best: Exit | None) -> str:
+                   best: Exit | None, probed: int) -> str:
     if best is None:
-        exit_line = "Жодного виходу не проквотовано цього разу."
+        exit_line = f"Жодного маршруту не знайдено серед {probed} перевірених мереж."
     else:
         exit_line = (
-            f"Найдешевший зараз: {best.chain} −{best.loss_pct:.2f}% "
-            f"(<code>{best.provider}</code>), це гірше за поріг "
-            f"{cfg.max_exit_loss_pct:.2f}%."
+            f"Найдешевший із {probed} перевірених: {best.chain} −{best.loss_pct:.2f}% "
+            f"(<code>{best.provider}</code>), гірше за поріг {cfg.max_exit_loss_pct:.2f}%."
         )
     return (
         f"🟠 <b>ШИРОКИЙ СПРЕД</b> {_pct(spread)} — виходу немає\n\n"
@@ -139,43 +188,52 @@ async def tick(cfg: Config, core: HyperCore, markets: Markets,
     spread = 100.0 * (sale.usdc_out / fill.cost_usd - 1.0)
     store.update("spread", last_pct=round(spread, 3), buy_px=round(fill.avg_px, 6))
 
-    interesting = spread >= (cfg.go_spread_pct - cfg.clear_margin_pct)
-    background = tick_no % BACKGROUND_EXIT_EVERY == 0
-    exits: list[Exit] = []
+    # How hard to search depends on whether there is anything to capture.
+    # One working exit is all the trade needs, so the sweep stops at the first
+    # open chain; the budget only matters when nothing is open, which is
+    # exactly when it is worth looking further down the list.
+    want_open = 1
+    if spread >= cfg.go_spread_pct:
+        budget = cfg.probes_hot
+    elif spread >= cfg.go_spread_pct - cfg.clear_margin_pct:
+        budget = cfg.probes_warm
+    elif tick_no % 10 == 0:
+        budget = cfg.probes_cold
+    else:
+        budget, want_open = 0, 0
 
-    if interesting or background:
-        chains = list(cfg.core_chains)
-        if cfg.rotating_chains and cfg.rotate_per_tick:
-            start = (tick_no * cfg.rotate_per_tick) % len(cfg.rotating_chains)
-            for i in range(min(cfg.rotate_per_tick, len(cfg.rotating_chains))):
-                chains.append(cfg.rotating_chains[(start + i) % len(cfg.rotating_chains)])
-        exits = await probe_exits(cfg, markets, sale.usdc_out, chains)
-
+    exits = (
+        await sweep_exits(cfg, markets, store, sale.usdc_out, budget, want_open)
+        if budget else []
+    )
+    opens = sorted(
+        (e for e in exits if e.loss_pct <= cfg.max_exit_loss_pct),
+        key=lambda e: e.loss_pct,
+    )
     best = min(exits, key=lambda e: e.loss_pct) if exits else None
-    exit_ok = best is not None and best.loss_pct <= cfg.max_exit_loss_pct
     net_pct = (
-        100.0 * ((sale.usdc_out * (1 - best.loss_pct / 100.0)) / cfg.notional_usd - 1.0)
-        if best else float("nan")
+        100.0 * ((sale.usdc_out * (1 - opens[0].loss_pct / 100.0)) / cfg.notional_usd - 1.0)
+        if opens else float("nan")
     )
 
     log.info(
-        "spread %+.2f%% | buy %.5f | sell %.2f USDC | best exit %s | net %s",
+        "spread %+.2f%% | buy %.5f | sell %.2f USDC | best %s | open %d | net %s",
         spread, fill.avg_px, sale.usdc_out,
         f"{best.chain} -{best.loss_pct:.2f}% ({best.provider})" if best else "not probed",
-        f"{net_pct:+.2f}%" if best else "n/a",
+        len(opens), f"{net_pct:+.2f}%" if opens else "n/a",
     )
 
     # --- GO: spread wide enough and the money can get back out ---
     armed_go = bool(store.get("go").get("armed"))
-    if spread >= cfg.go_spread_pct and exit_ok:
+    if spread >= cfg.go_spread_pct and opens:
         if not armed_go and not store.in_cooldown("go", cfg.alert_cooldown_seconds):
             store.update("go", armed=True)
             store.mark_alerted("go")
             await tg.send(go_message(
                 cfg, fill.avg_px, fill.qty, sale.usdc_out, spread,
-                best, net_pct, fill.book_depth_usd,
+                opens, net_pct, fill.book_depth_usd,
             ))
-            log.info("GO alert sent: net %+.2f%% via %s", net_pct, best.chain)
+            log.info("GO alert sent: net %+.2f%% via %s", net_pct, opens[0].chain)
         else:
             store.update("go", armed=True)
     elif armed_go and spread < (cfg.go_spread_pct - cfg.clear_margin_pct):
@@ -184,11 +242,11 @@ async def tick(cfg: Config, core: HyperCore, markets: Markets,
 
     # --- URGENT: spread very wide, sent whether or not an exit exists ---
     armed_urgent = bool(store.get("urgent").get("armed"))
-    if spread >= cfg.urgent_spread_pct and not exit_ok:
+    if spread >= cfg.urgent_spread_pct and not opens:
         if not armed_urgent and not store.in_cooldown("urgent", cfg.alert_cooldown_seconds):
             store.update("urgent", armed=True)
             store.mark_alerted("urgent")
-            await tg.send(urgent_message(cfg, spread, sale.usdc_out, best))
+            await tg.send(urgent_message(cfg, spread, sale.usdc_out, best, len(exits)))
             log.info("URGENT alert sent at %+.2f%%", spread)
         else:
             store.update("urgent", armed=True)
@@ -219,11 +277,11 @@ async def run() -> int:
         tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http)
 
         await tg.send(
-            f"▶️ <b>Монітор KNTQ Elysium запущено</b>\n"
+            f"▶️ <b>Монітор KNTQ Elysium запущено</b>  v{VERSION}\n"
             f"Коло: ${cfg.notional_usd:,.0f}\n"
             f"Алерт від {cfg.go_spread_pct:.1f}% зі здатним виходом (≤{cfg.max_exit_loss_pct:.1f}%)\n"
             f"Алерт від {cfg.urgent_spread_pct:.1f}% у будь-якому разі\n"
-            f"Мережі: {', '.join(CHAIN_NAMES.get(c, str(c)) for c in cfg.core_chains)}"
+            f"Мереж під наглядом: {len(cfg.chains)}"
         )
 
         tick_no = 0
@@ -245,11 +303,17 @@ async def run() -> int:
                 last_flush = now
 
             if now - last_heartbeat >= cfg.heartbeat_seconds:
+                chains = store.get("chains")
+                open_now = [
+                    CHAIN_NAMES.get(int(c), c) for c, r in chains.items()
+                    if (r.get("loss") is not None and r["loss"] <= cfg.max_exit_loss_pct)
+                ]
                 log.info(
-                    "heartbeat: ticks=%d spread=%s lifi=%d other=%d hl=%d redis=%d",
-                    tick_no, store.get("spread").get("last_pct"),
-                    markets.lifi_requests, markets.other_requests,
-                    core.request_count, store.command_count,
+                    "heartbeat: ticks=%d spread=%s measured=%d open=%s "
+                    "lifi=%d other=%d hl=%d redis=%d",
+                    tick_no, store.get("spread").get("last_pct"), len(chains),
+                    open_now or "none", markets.lifi_requests,
+                    markets.other_requests, core.request_count, store.command_count,
                 )
                 last_heartbeat = now
 

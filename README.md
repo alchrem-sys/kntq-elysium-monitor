@@ -81,12 +81,31 @@ Every variable is documented in `.env.example`. Required: `TELEGRAM_BOT_TOKEN`,
 rate limit is low enough that a few minutes of probing will lock you out for an
 hour. Free key at <https://portal.li.fi>.
 
+## Which chains, and how they are probed
+
+38 EVM chains are watched — every one LI.FI lists a USDC for. They are never
+all quoted at once; LI.FI's rate limit does not allow it, and finding out the
+hard way costs an hour's lockout.
+
+Instead each chain's last measured exit cost is kept in Redis, and probes are
+spent in priority order:
+
+1. chains last seen open, cheapest first
+2. chains never measured, or whose reading has gone stale
+3. chains last seen drained
+
+The sweep stops at the **first** open exit, because one working route is all
+the trade needs. In the common case that costs a single request. The budget
+only bites when nothing is open anywhere — which is exactly when searching
+further down the list is worth it.
+
 ## Request budget
 
-Per tick (default 120s): 1 order book + 1 Kyber quote. Exit quotes are only
-spent when the spread is within `CLEAR_MARGIN_PCT` of the trigger, plus one
-background sample every tenth tick — so a quiet market costs ~1,440 calls a day
-and burns no LI.FI quota.
+Per tick (default 120s): 1 order book + 1 Kyber quote. Exit quotes are spent
+only when the spread is within `CLEAR_MARGIN_PCT` of the trigger, plus one
+background sample every tenth tick. So a quiet market costs ~1,440 calls a day
+and burns no LI.FI quota; a live spread with a working exit costs one LI.FI
+call per tick; a live spread with every chain drained costs up to `PROBES_HOT`.
 
 Redis: one `HGETALL` at startup, then one pipelined write per 60s flush and only
 when something changed — about 2,900 commands a day worst case, and none at all

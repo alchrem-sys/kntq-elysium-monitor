@@ -1,10 +1,10 @@
 """Offline harness driving the real tick logic with recorded live data.
 
-The build sandbox has no egress to api.hyperliquid.xyz, li.quest or
-kyberswap, so the HTTP boundary is stubbed with responses those services
-actually returned on 2026-11-10. The order book below is the real @334
-KNTQ/USDC book. Everything below the HTTP layer -- book walking, spread
-maths, thresholds, hysteresis, cooldown, message text -- is production code.
+The build sandbox has no egress to api.hyperliquid.xyz, li.quest or kyberswap,
+so the HTTP boundary is stubbed with responses those services actually returned
+on 2026-11-10 -- the order book below is the real @334 KNTQ/USDC book.
+Everything below the HTTP layer (book walking, spread maths, probe ordering,
+early exit, thresholds, hysteresis, message text) is production code.
 """
 from __future__ import annotations
 
@@ -13,14 +13,12 @@ import os
 
 os.environ.update(
     TELEGRAM_BOT_TOKEN="test-token",
-    TELEGRAM_CHAT_ID="868931721",
+    TELEGRAM_CHAT_ID="@test",
     REDIS_URL="rediss://unused",
     NOTIONAL_USD="3000",
     GO_SPREAD_PCT="3.0",
     URGENT_SPREAD_PCT="5.0",
     MAX_EXIT_LOSS_PCT="1.0",
-    CORE_CHAINS="10,42161",
-    ROTATING_CHAINS="8453",
     REQUEST_SPACING_SECONDS="0",
     ALERT_COOLDOWN_SECONDS="0",
 )
@@ -30,7 +28,6 @@ from hyperliquid import HyperCore  # noqa: E402
 from main import tick  # noqa: E402
 from markets import Markets  # noqa: E402
 
-# Real ask side of @334, 2026-11-10 19:00 UTC
 ASKS = [
     {"px": "0.33833", "sz": "883.77"},
     {"px": "0.3386", "sz": "36.56"},
@@ -40,7 +37,7 @@ ASKS = [
 ]
 BIDS = [{"px": "0.33774", "sz": "586.12"}]
 
-WORLD = {"elysium_px": 0.340817, "exit_loss": {10: 0.27, 42161: 3.02, 8453: 3.00}}
+WORLD = {"elysium_px": 0.340817, "open": {}, "default_loss": 3.02, "probed": []}
 
 
 class R:
@@ -52,9 +49,6 @@ class R:
     def json(self):
         return self._p
 
-    def raise_for_status(self):
-        return None
-
 
 class FakeHttp:
     def __init__(self):
@@ -65,11 +59,8 @@ class FakeHttp:
             return R({"coin": "@334", "levels": [BIDS, ASKS]})
         if "relay.link" in url:
             amt = int(json["amount"]) / 1e6
-            loss = 3.05
-            return R({"details": {
-                "currencyOut": {"amountFormatted": str(amt * (1 - loss / 100)),
-                                "currency": {"symbol": "USDC"}},
-                "timeEstimate": 2}})
+            return R({"details": {"currencyOut": {
+                "amountFormatted": str(amt * 0.9695)}, "timeEstimate": 2}})
         if "telegram" in url:
             self.sent.append(json["text"])
             return R({"ok": True})
@@ -83,8 +74,9 @@ class FakeHttp:
                 "amountOut": str(int(out * 1e6)), "route": [1, 2, 3]}}})
         if "li.quest" in url:
             chain = int(params["toChain"])
+            WORLD["probed"].append(chain)
             amt = int(params["fromAmount"]) / 1e6
-            loss = WORLD["exit_loss"].get(chain, 3.0)
+            loss = WORLD["open"].get(chain, WORLD["default_loss"])
             out = amt * (1 - loss / 100)
             return R({"tool": "lifiIntents" if loss < 1 else "relaydepository",
                       "action": {"toToken": {"decimals": 6}},
@@ -104,6 +96,9 @@ class FakeStore:
     def update(self, f, **v):
         self.get(f).update(v)
 
+    def touch(self):
+        pass
+
     def in_cooldown(self, f, s):
         return False
 
@@ -116,47 +111,50 @@ class TG:
         self.http = h
 
     async def send(self, text):
-        print("\n" + "=" * 58)
+        print("\n" + "=" * 60)
         for tag in ("<b>", "</b>", "<code>", "</code>"):
             text = text.replace(tag, "")
         print(text)
-        print("=" * 58)
+        print("=" * 60)
         return True
 
 
 async def main() -> None:
     cfg = config.load()
+    print(f"Chains under watch: {len(cfg.chains)}")
     http = FakeHttp()
     core, markets, store, tg = HyperCore("@334", http), Markets(cfg, http), FakeStore(), TG(http)
 
     fill = await core.buy_fill(cfg.notional_usd, cfg.taker_fee_pct)
-    print(f"Book walk: ${cfg.notional_usd:,.0f} -> {fill.qty:,.2f} KNTQ "
-          f"@ {fill.avg_px:.5f} (worst level {fill.worst_px}), "
-          f"ask depth ${fill.book_depth_usd:,.0f}, filled={fill.filled}")
+    print(f"Book walk: ${cfg.notional_usd:,.0f} -> {fill.qty:,.2f} KNTQ @ {fill.avg_px:.5f}\n")
 
-    print("\n### 1. Live market right now: Elysium 0.340817, OP exit open")
-    await tick(cfg, core, markets, store, tg, 0)
-
-    print("\n### 2. Spread widens to ~3.5%, OP still open -> expect GO")
-    WORLD["elysium_px"] = 0.3505
+    print("### 1. Spread 0.5% -> no exit probes at all (saves LI.FI quota)")
+    WORLD["probed"].clear()
     await tick(cfg, core, markets, store, tg, 1)
+    print(f"    chains probed: {len(WORLD['probed'])}")
 
-    print("\n### 3. Same spread again -> must stay quiet (already armed)")
+    print("\n### 2. Spread 3.4%, nothing known yet, Optimism + Linea open")
+    WORLD["elysium_px"] = 0.3505
+    WORLD["open"] = {10: 0.27, 59144: 0.55}
+    WORLD["probed"].clear()
     await tick(cfg, core, markets, store, tg, 2)
+    print(f"    chains probed: {len(WORLD['probed'])} -> {WORLD['probed']}")
 
-    print("\n### 4. Spread 6%, every exit drained -> expect URGENT only")
-    WORLD["elysium_px"] = 0.3600
-    WORLD["exit_loss"] = {10: 3.01, 42161: 3.02, 8453: 3.00}
-    store.data.clear()
+    print("\n### 3. Same spread, Optimism now known-good -> should probe it first")
+    WORLD["probed"].clear()
+    store.data["go"]["armed"] = False
     await tick(cfg, core, markets, store, tg, 3)
+    print(f"    chains probed: {len(WORLD['probed'])} -> {WORLD['probed']}")
 
-    print("\n### 5. Spread back to 1% -> silence")
-    WORLD["elysium_px"] = 0.3425
+    print("\n### 4. Spread 6%, every chain drained -> URGENT, deeper search")
+    WORLD["elysium_px"] = 0.3600
+    WORLD["open"] = {}
+    WORLD["probed"].clear()
+    store.data.clear()
     await tick(cfg, core, markets, store, tg, 4)
+    print(f"    chains probed: {len(WORLD['probed'])}")
 
-    print(f"\nTelegram messages sent: {len(http.sent)}")
-    print(f"LI.FI requests: {markets.lifi_requests}  other: {markets.other_requests}  "
-          f"hyperliquid: {core.request_count}")
+    print(f"\nTelegram messages: {len(http.sent)}  LI.FI requests: {markets.lifi_requests}")
 
 
 if __name__ == "__main__":
