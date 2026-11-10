@@ -54,6 +54,20 @@ class HyperCore:
             delay = min(delay * 2, 8.0)
         return None
 
+    async def hype_mid(self) -> float | None:
+        """HYPE mid, used only to render the HYPE leg in dollars.
+
+        Carrier choice never depends on this -- both carriers are compared on
+        the USDC they actually deliver.
+        """
+        mids = await self._post({"type": "allMids"})
+        if isinstance(mids, dict) and mids.get("HYPE"):
+            try:
+                return float(mids["HYPE"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
     async def buy_fill(self, notional_usd: float, taker_fee_pct: float) -> Fill | None:
         """What buying `notional_usd` of the base token actually costs right now."""
         book = await self._post({"type": "l2Book", "coin": self.coin})

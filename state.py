@@ -1,8 +1,12 @@
-"""Redis-backed state, written to a request budget.
+"""Redis-backed state, written to a free-tier request budget.
 
-Memory is the working copy. One HGETALL at startup, one pipelined write per
-flush interval and only when something changed. An idle service makes no
-Redis calls at all.
+The whole state is one JSON blob under one key, so a flush is a single SET
+with a TTL rather than an HSET plus an EXPIRE, and a cold start is a single
+GET. Memory is the working copy; Redis only sees it on the flush interval,
+and only when something actually changed. An idle service makes no Redis
+calls at all.
+
+Steady state at the default 300s flush: ~289 commands a day.
 """
 from __future__ import annotations
 
@@ -24,16 +28,22 @@ class Store:
         self.data: dict[str, dict] = {}
         self._dirty = False
         self.command_count = 0
+        self.write_failures = 0
 
     async def load(self) -> None:
         self.command_count += 1
-        raw = await self._redis.hgetall(KEY)
-        for field, blob in raw.items():
-            try:
-                self.data[field] = json.loads(blob)
-            except json.JSONDecodeError:
-                log.warning("Dropping unreadable state field %s", field)
-        log.info("Loaded %d state field(s) from Redis", len(self.data))
+        raw = await self._redis.get(KEY)
+        if not raw:
+            log.info("No saved state; starting cold")
+            return
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("Saved state is unreadable; starting cold")
+            return
+        if isinstance(loaded, dict):
+            self.data = loaded
+            log.info("Loaded %d state field(s) from Redis", len(self.data))
 
     def get(self, field: str) -> dict:
         return self.data.setdefault(field, {})
@@ -59,18 +69,13 @@ class Store:
     async def flush(self, force: bool = False) -> None:
         if not self._dirty and not force:
             return
-        payload = {k: json.dumps(v) for k, v in self.data.items()}
-        if not payload:
+        if not self.data:
             self._dirty = False
             return
-        # transaction=False: Upstash rejects MULTI/EXEC ("no permissions to run
-        # the 'exec' command"). These two writes need no atomicity anyway --
-        # worst case the TTL is refreshed a moment after the data.
-        pipe = self._redis.pipeline(transaction=False)
-        pipe.hset(KEY, mapping=payload)
-        pipe.expire(KEY, TTL_SECONDS)
-        await pipe.execute()
-        self.command_count += 2
+        # One command: SET with TTL. Upstash denies MULTI/EXEC, and a free
+        # tier is metered per command, so this stays deliberately minimal.
+        await self._redis.set(KEY, json.dumps(self.data), ex=TTL_SECONDS)
+        self.command_count += 1
         self._dirty = False
 
     async def close(self) -> None:

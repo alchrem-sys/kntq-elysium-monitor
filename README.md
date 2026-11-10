@@ -32,6 +32,41 @@ Arbitrum, Base and HyperEVM all sat at ~3.0% after being drained.
 The canonical bridge is always available at 0% and about six days. Since what
 sits in that queue is USDC, the wait carries no price risk — only frozen capital.
 
+## Two carriers, and why neither is hardcoded
+
+KNTQ can leave Elysium as USDC or as HYPE, and the better one moves.
+
+Selling into HYPE quotes about 1% above selling into USDC — measured
+2026-11-10, consistently across sizes:
+
+| Size | → USDC | → HYPE (at spot) | HYPE better by |
+| --- | --- | --- | --- |
+| 3,000 KNTQ | $1,024.50 | $1,033.99 | +0.93% |
+| 9,000 KNTQ | $3,070.24 | $3,099.33 | +0.95% |
+| 30,000 KNTQ | $10,213.57 | $10,313.39 | +0.98% |
+
+That gap is not free money. Converting the HYPE straight back to USDC on
+Elysium lands at $3,070.10 — exactly the direct route — because Elysium USDC
+trades under a dollar: everyone leaving sells it cheap. Solvers know that and
+price the HYPE bridge accordingly, handing some or all of the premium back.
+Through Relay the premium vanished entirely; through LI.FI Intents roughly
+half of it survived.
+
+So both carriers are measured end to end, from the same KNTQ quantity to USDC
+actually delivered on the destination chain, and the winner is whichever pays
+more. No HYPE price feed enters that decision, which is what makes it
+trustworthy — a spot mark would quietly decide the answer.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/spread 2.5%` | Set the alert threshold. Persisted, survives restarts. |
+| `/pulls` | Routes that can take the money out under `MAX_EXIT_LOSS_PCT`, with how much each can absorb. |
+| `/status` | Latest spread, fill price, chosen carrier, best exit. |
+
+`/spread` and `/pulls` are limited to `TELEGRAM_ADMIN_ID` when it is set.
+
 ## Alerts
 
 **GO** — spread ≥ `GO_SPREAD_PCT` *and* some chain can take the money back out

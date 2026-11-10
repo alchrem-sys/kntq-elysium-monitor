@@ -26,6 +26,10 @@ USDC_ELYSIUM = "0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65"
 # HyperCore spot pair KNTQ/USDC, as app.hyperliquid.xyz/trade/KNTQ/USDC.
 HYPERCORE_KNTQ_USDC = "@334"
 
+# Native HYPE is spelled differently by each API.
+KYBER_NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+LIFI_NATIVE = "0x0000000000000000000000000000000000000000"
+
 # Every EVM mainnet LI.FI lists a USDC for, 2026-11-10. Testnets excluded.
 # Destination decimals are read from each quote, so BSC's 18-decimal USDC
 # needs no special case here.
@@ -141,6 +145,7 @@ def _chains(name: str, default: list[int]) -> list[int]:
 class Config:
     telegram_token: str
     telegram_chat_id: str
+    telegram_admin_id: str
     redis_url: str
     lifi_api_key: str
     lifi_base: str
@@ -163,9 +168,12 @@ class Config:
     poll_seconds: float = 120.0
     spacing_seconds: float = 2.0
     alert_cooldown_seconds: float = 600.0
-    flush_seconds: float = 60.0
+    # Upstash free tier is metered per command, so flush rarely and only on
+    # change: one SET per interval works out to roughly 289 commands a day.
+    flush_seconds: float = 300.0
     heartbeat_seconds: float = 900.0
     http_timeout: float = 25.0
+    command_poll_seconds: float = 25.0   # Telegram long-poll timeout
 
 
 def load() -> Config:
@@ -179,6 +187,7 @@ def load() -> Config:
     return Config(
         telegram_token=_req("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_req("TELEGRAM_CHAT_ID"),
+        telegram_admin_id=os.getenv("TELEGRAM_ADMIN_ID", "").strip(),
         redis_url=_req("REDIS_URL"),
         lifi_api_key=os.getenv("LIFI_API_KEY", "").strip(),
         lifi_base=os.getenv("LIFI_BASE_URL", "https://li.quest/v1").rstrip("/"),
@@ -199,6 +208,7 @@ def load() -> Config:
         poll_seconds=_num("POLL_SECONDS", 120.0),
         spacing_seconds=_num("REQUEST_SPACING_SECONDS", 2.0),
         alert_cooldown_seconds=_num("ALERT_COOLDOWN_SECONDS", 600.0),
+        flush_seconds=_num("FLUSH_SECONDS", 300.0),
     )
 
 
