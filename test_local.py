@@ -16,6 +16,7 @@ os.environ.update(
     TELEGRAM_CHAT_ID="@test",
     TELEGRAM_ADMIN_ID="868931721",
     REDIS_URL="rediss://unused",
+    PUSHOVER_APP_TOKEN="app-test-token",
     NOTIONAL_USD="3000",
     GO_SPREAD_PCT="3.0",
     URGENT_SPREAD_PCT="5.0",
@@ -27,7 +28,9 @@ os.environ.update(
 import config  # noqa: E402
 from commands import CommandServer, Runtime  # noqa: E402
 from hyperliquid import HyperCore  # noqa: E402
+import main as M  # noqa: E402
 from main import snapshot, tick  # noqa: E402
+from notify import Pushover  # noqa: E402
 from markets import Markets  # noqa: E402
 
 ASKS = [
@@ -64,8 +67,17 @@ class FakeHttp:
         if "relay.link" in url:
             return R({"details": {"currencyOut": {"amountFormatted": "1"}, "timeEstimate": 2}})
         if "telegram" in url:
+            if url.endswith("/deleteMessage"):
+                print(f"    [deleteMessage chat={json['chat_id']} msg={json['message_id']}]")
             self.sent.append(json)
             return R({"ok": True})
+        if "pushover.net" in url:
+            d = kw.get("data") or {}
+            if "validate" in url:
+                return R({"status": 1, "devices": ["iphone"]})
+            print(f"    >>> PUSHOVER [{d.get('priority')}] {d.get('title')} | {d.get('message')}"
+                  f" | url={d.get('url_title')}")
+            return R({"status": 1})
         return R({}, 404)
 
     async def get(self, url, params=None, headers=None, **kw):
@@ -146,7 +158,12 @@ async def main() -> None:
     core, markets, store = HyperCore("@334", http), Markets(cfg, http), FakeStore()
     tg = TG(http)
     rt = Runtime(cfg, store)
-    cmds = CommandServer(cfg, http, markets, store, rt, tg, snapshot)
+    M._push = Pushover(cfg.pushover_app_token, http, store)
+    cmds = CommandServer(cfg, http, markets, store, rt, tg, snapshot, M._push)
+
+    print('### 0. /pushover USER_KEY -> validated, message deleted')
+    await cmds._cmd_pushover('uQiRzpo4DXghDmr9QzzfQu27cmVRsG', {'chat': {'id': -100}, 'message_id': 42})
+    await cmds._cmd_pushover('test', {})
 
     print("### 1. Quiet spread -> silence")
     await tick(cfg, rt, core, markets, store, tg, 1)

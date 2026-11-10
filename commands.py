@@ -26,6 +26,7 @@ PULLS_RE = re.compile(r"^/pulls(?:@\S+)?\s*$", re.I)
 STATUS_RE = re.compile(r"^/status(?:@\S+)?\s*$", re.I)
 TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
 TEST_RE = re.compile(r"^/test(?:@\S+)?\s*$", re.I)
+PUSHOVER_RE = re.compile(r"^/pushover(?:@\S+)?(?:\s+(\S+))?\s*$", re.I)
 ONLY_RE = re.compile(r"^/only(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 
 # Ladder used to measure how much a route can absorb before it stops clearing
@@ -50,7 +51,7 @@ class Runtime:
 
 class CommandServer:
     def __init__(self, cfg: Config, http: httpx.AsyncClient, markets: Markets,
-                 store, runtime: Runtime, tg, snapshot):
+                 store, runtime: Runtime, tg, snapshot, pushover=None):
         self.cfg = cfg
         self.http = http
         self.markets = markets
@@ -58,6 +59,7 @@ class CommandServer:
         self.runtime = runtime
         self.tg = tg
         self.snapshot = snapshot          # callable -> dict of latest tick data
+        self.pushover = pushover
         self._offset: int | None = None
         self._base = f"https://api.telegram.org/bot{cfg.telegram_token}"
 
@@ -112,6 +114,10 @@ class CommandServer:
             if not self._is_admin(msg):
                 return
             await self._cmd_test()
+        elif m := PUSHOVER_RE.match(text):
+            if not self._is_admin(msg):
+                return
+            await self._cmd_pushover(m.group(1), msg)
         elif m := ONLY_RE.match(text):
             if not self._is_admin(msg):
                 return
@@ -131,6 +137,54 @@ class CommandServer:
             f"маршрут, ціна і скільки він тримає.\n"
             f"Потім зніметься сам — викличеш <code>/tell</code> ще раз, якщо треба."
         )
+
+    async def _delete(self, msg: dict) -> bool:
+        """Remove the message that carried the user key, so it doesn't sit in the chat."""
+        try:
+            r = await self.http.post(f"{self._base}/deleteMessage", json={
+                "chat_id": (msg.get("chat") or {}).get("id"),
+                "message_id": msg.get("message_id")})
+            return bool(r.is_success and r.json().get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _cmd_pushover(self, value: str | None, msg: dict) -> None:
+        po = self.pushover
+        if po is None:
+            await self.tg.send("Pushover не підключено в цій збірці.")
+            return
+        if not value:
+            key = po.user_key
+            await self.tg.send(
+                f"Pushover: app token {'є' if po.app_token else '<b>немає</b> (PUSHOVER_APP_TOKEN)'}, "
+                f"user key {'задано …' + key[-4:] if key else '<b>не задано</b>'}\n"
+                f"<code>/pushover USER_KEY</code> — задати · "
+                f"<code>/pushover test</code> — перевірити · "
+                f"<code>/pushover off</code> — вимкнути")
+            return
+        low = value.lower()
+        if low == "off":
+            self.store.update("pushover", user=None)
+            await self.tg.send("🔕 Pushover вимкнено.")
+            return
+        if low == "test":
+            if not po.ready:
+                await self.tg.send("Спочатку задай ключ: <code>/pushover USER_KEY</code>")
+                return
+            ok = await po.send("KNTQ monitor", "Тестовий пуш — усе працює ✅", priority=0)
+            await self.tg.send("✅ Пуш відправлено" if ok else "❌ Pushover відхилив запит, глянь логи")
+            return
+        deleted = await self._delete(msg)
+        ok, info = await po.validate(value)
+        if not ok:
+            await self.tg.send(f"❌ Ключ не прийнято: {info}")
+            return
+        self.store.update("pushover", user=value)
+        await po.send("KNTQ monitor", "Pushover підключено ✅", priority=0)
+        await self.tg.send(
+            f"✅ Pushover підключено, ключ …{value[-4:]}, пристрої: {info}\n"
+            + ("Повідомлення з ключем видалив." if deleted
+               else "⚠️ Не зміг видалити повідомлення з ключем — видали його сам, група публічна."))
 
     async def _cmd_only(self, value: str | None) -> None:
         """Watch the spread and nothing else.
@@ -157,8 +211,7 @@ class CommandServer:
         self.store.update("only", pct=pct, fired=False)
         await self.tg.send(
             f"👁 Стежу за спредом вище <b>{pct:.2f}%</b>.\n"
-            f"Коли перевалить — прилетить <code>/gm</code>, "
-            f"а наступним повідомленням цифри.\n"
+            f"Коли перевалить — пуш у Pushover і повідомлення з цифрами тут.\n"
             f"Далі мовчу, поки спред не впаде нижче "
             f"{max(0.0, pct - self.cfg.clear_margin_pct):.2f}% і не підніметься знову."
         )

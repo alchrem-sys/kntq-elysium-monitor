@@ -42,7 +42,9 @@ import httpx
 import config
 from commands import DEPTH_LADDER, CommandServer, Runtime
 from config import (
+    BRIDGE_URL,
     CHAIN_NAMES,
+    HYPE_SPOT_URL,
     Config,
     HYPERCORE_KNTQ_USDC,
     KNTQ_ELYSIUM,
@@ -52,7 +54,7 @@ from config import (
 )
 from hyperliquid import HyperCore
 from markets import Exit, Markets, RateLimited
-from notify import Telegram
+from notify import Pushover, Telegram
 from routing import exit_order, remember
 from state import Store
 
@@ -70,6 +72,14 @@ _snapshot: dict = {}
 
 # /only re-fires once the spread climbs this much above where it last fired.
 ESCALATION_PCT = 1.0
+_push: Pushover | None = None
+
+
+async def push(title: str, message: str, priority: int = 1,
+               url: str | None = None, url_title: str | None = None) -> None:
+    if _push is not None and _push.ready:
+        if not await _push.send(title, message, priority, url, url_title):
+            log.warning("Pushover send failed")
 
 
 def snapshot() -> dict:
@@ -236,7 +246,11 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
         )
         if due:
             store.update("only", fired=True, fired_at=round(spread, 3))
-            await tg.send("/gm")
+            await push(f"KNTQ спред {_pct(spread)}",
+                       f"Поріг {only_pct:.2f}%. ${cfg.notional_usd:,.0f} → "
+                       f"{sell_used:,.2f} USDC на Elysium "
+                       f"({cfg.notional_usd * spread / 100:+,.0f}$ валом).",
+                       priority=1, url=HYPE_SPOT_URL, url_title="Hype Spot")
             await tg.send(
                 f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
                 f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
@@ -313,6 +327,9 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
                                             best.carrier, leg[0], leg[1])
         if depth >= target:
             store.update("tell", armed=False)
+            await push(f"Вихід відкрився: {best.chain}",
+                       f"{best.carrier} −{best.loss_pct:.2f}%, тримає ${depth:,.0f}",
+                       priority=1)
             await tg.send(tell_message(best.chain, best.carrier, best.provider,
                                        best.loss_pct, best.usdc_out, depth,
                                        capped, target), buttons)
@@ -323,6 +340,10 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
         if not armed_go and not store.in_cooldown("go", cfg.alert_cooldown_seconds):
             store.update("go", armed=True)
             store.mark_alerted("go")
+            await push(f"КОЛО ВІДКРИТЕ {_pct(t['net'])}",
+                       f"Спред {_pct(spread)}, вихід {t['chain']} −{t['exit_loss']:.2f}%, "
+                       f"нетто {t['net_usd']:+,.0f}$", priority=1,
+                       url=HYPE_SPOT_URL, url_title="Hype Spot")
             await tg.send(go_message(threshold, t, alt), buttons)
             log.info("GO sent: net %+.2f%% via %s", net, best.chain)
         else:
@@ -338,6 +359,8 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
             store.mark_alerted("urgent")
             line = (f"Найдешевший із {len(exits)}: {cheapest.chain} / {cheapest.carrier} "
                     f"−{cheapest.loss_pct:.2f}%." if cheapest else "Жодного маршруту.")
+            await push(f"Широкий спред {_pct(spread)}", "Виходу немає. " + line,
+                       priority=1, url=BRIDGE_URL, url_title="Bridge")
             await tg.send(
                 f"🟠 <b>ШИРОКИЙ СПРЕД</b> {_pct(spread)} — виходу немає\n\n"
                 f"${cfg.notional_usd:,.0f} → {sell_used:,.2f} USDC на Elysium.\n{line}",
@@ -409,13 +432,16 @@ async def run() -> int:
         markets = Markets(cfg, http)
         tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http)
         rt = Runtime(cfg, store)
-        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot)
+        global _push
+        _push = Pushover(cfg.pushover_app_token, http, store)
+        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push)
 
         await tg.send(
             f"▶️ <b>Монітор KNTQ Elysium</b>  v{VERSION}\n"
             f"Коло: ${cfg.notional_usd:,.0f} · мереж: {len(cfg.chains)}\n"
             f"Поріг: {rt.go_spread_pct:.2f}% · вихід ≤{cfg.max_exit_loss_pct:.2f}%\n\n"
-            f"<code>/only 2</code> — стежити лише за спредом, шле /gm\n"
+            f"<code>/only 2</code> — стежити лише за спредом, пуш у Pushover\n"
+            f"<code>/pushover USER_KEY</code> — підключити Pushover\n"
             f"<code>/spread 2.5%</code> — поріг для алерта з виходом\n"
             f"<code>/tell</code> — сповістити, коли з'явиться пул на "
             f"${cfg.notional_usd:,.0f}\n"

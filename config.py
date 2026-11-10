@@ -176,6 +176,7 @@ class Config:
     telegram_token: str
     telegram_chat_id: str
     telegram_admin_id: str
+    pushover_app_token: str
     redis_url: str
     lifi_api_key: str
     lifi_base: str
@@ -218,6 +219,7 @@ def load() -> Config:
         telegram_token=_req("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_req("TELEGRAM_CHAT_ID"),
         telegram_admin_id=os.getenv("TELEGRAM_ADMIN_ID", "").strip(),
+        pushover_app_token=os.getenv("PUSHOVER_APP_TOKEN", "").strip(),
         redis_url=_req("REDIS_URL"),
         lifi_api_key=os.getenv("LIFI_API_KEY", "").strip(),
         lifi_base=os.getenv("LIFI_BASE_URL", "https://li.quest/v1").rstrip("/"),
@@ -249,5 +251,6 @@ def summary(cfg: Config) -> str:
         f"chains={len(cfg.chains)} probes hot/warm/cold="
         f"{cfg.probes_hot}/{cfg.probes_warm}/{cfg.probes_cold} "
         f"poll={cfg.poll_seconds:.0f}s "
-        f"lifi_key={'set' if cfg.lifi_api_key else 'ABSENT (low rate limit)'}"
+        f"lifi_key={'set' if cfg.lifi_api_key else 'ABSENT (low rate limit)'} "
+        f"pushover_app={'set' if cfg.pushover_app_token else 'ABSENT'}"
     )
