@@ -76,7 +76,8 @@ class FakeHttp:
             if "validate" in url:
                 return R({"status": 1, "devices": ["iphone"]})
             print(f"    >>> PUSHOVER to …{d.get('user','')[-4:]} [{d.get('priority')}] {d.get('title')} | {d.get('message')}"
-                  f" | url={d.get('url_title')}")
+                  f" | url={d.get('url_title')}"
+                  + (f" | retry={d['retry']}s expire={d['expire']}s" if 'retry' in d else ""))
             return R({"status": 1})
         return R({}, 404)
 
@@ -125,6 +126,15 @@ class FakeStore:
     def touch(self):
         pass
 
+    async def save_settings(self):
+        print("    [settings saved to Redis]")
+
+    async def reload_settings(self):
+        pass
+
+    async def flush(self, force=False):
+        pass
+
     def in_cooldown(self, f, s):
         return False
 
@@ -163,9 +173,14 @@ async def main() -> None:
 
     me = {'from': {'id': 868931721, 'first_name': 'Lyosha'}, 'chat': {'id': -100}, 'message_id': 41}
     friend = {'from': {'id': 555000111, 'first_name': 'Friend'}, 'chat': {'id': -100}, 'message_id': 42}
-    print('### 0a. friend tries a command before access -> ignored')
+    print('### 0a. friend tries a command before access -> told why, with his ID')
     await cmds._dispatch('/only 2', friend)
     print('    only armed?', store.get('only').get('pct'))
+    print('### 0a2. same person again within 10 min -> no repeated nagging')
+    await cmds._dispatch('/only 2', friend)
+    print('### 0a3. anonymous admin -> told to switch anonymity off')
+    await cmds._dispatch('/only 2', {'from': {'id': 1087968824, 'first_name': 'Group'},
+                                     'sender_chat': {'id': -100}, 'chat': {'id': -100}, 'message_id': 9})
     print('### 0b. owner replies /allow to friend')
     await cmds._dispatch('/allow', {**me, 'reply_to_message': friend})
     print('### 0c. both connect their own Pushover keys')
@@ -174,6 +189,25 @@ async def main() -> None:
     print('### 0d. friend can now change things; /pushover test reaches both')
     await cmds._dispatch('/pushover test', friend)
     await cmds._dispatch('/myid', friend)
+    print('### 0e. /pushover priority 2 -> emergency, test push carries retry/expire')
+    await cmds._dispatch('/pushover priority 2', friend)
+    await cmds._dispatch('/pushover test', me)
+    await cmds._dispatch('/pushover priority 1', me)
+    print('### 0f. /poll 5')
+    await cmds._dispatch('/poll 5', friend)
+    print('    poll now', rt.spread_poll_seconds)
+
+    print('### 0g. fast spread loop: /only fires from it, and it wakes the full tick')
+    await cmds._dispatch('/only 2', friend)
+    store.get('runtime')['spread_poll_seconds'] = 0.05
+    W["mult"] = 1.03
+    M._wake.clear()
+    task = asyncio.create_task(M.spread_loop(cfg, rt, core, markets, store, tg))
+    await asyncio.sleep(0.4)
+    M._stop.set(); await task; M._stop.clear()
+    print('    wake requested:', M._wake.is_set())
+    store.update('only', pct=None, fired=False, fired_at=None)
+    W["mult"] = 1.0
 
     print("### 1. Quiet spread -> silence")
     await tick(cfg, rt, core, markets, store, tg, 1)

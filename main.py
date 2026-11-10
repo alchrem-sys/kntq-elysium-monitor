@@ -68,6 +68,7 @@ logging.basicConfig(
 log = logging.getLogger("monitor")
 
 _stop = asyncio.Event()
+_wake = asyncio.Event()   # fast loop asks the full tick to run now
 _snapshot: dict = {}
 
 # /only re-fires once the spread climbs this much above where it last fired.
@@ -75,7 +76,7 @@ ESCALATION_PCT = 1.0
 _push: Pushover | None = None
 
 
-async def push(title: str, message: str, priority: int = 1,
+async def push(title: str, message: str, priority: int | None = None,
                url: str | None = None, url_title: str | None = None) -> None:
     if _push is not None and _push.ready:
         if not await _push.send(title, message, priority, url, url_title):
@@ -89,6 +90,7 @@ def snapshot() -> dict:
 def _request_stop(*_args) -> None:
     log.info("Signal received; finishing tick and flushing state")
     _stop.set()
+    _wake.set()
 
 
 def _pct(v: float) -> str:
@@ -197,6 +199,92 @@ def tell_message(chain: str, carrier: str, provider: str, loss: float,
     )
 
 
+async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
+                     fill, sell_used: float) -> None:
+    """/only: spread watch. Fires on crossing the threshold, and again each
+    time the spread climbs ESCALATION_PCT above where it last fired, so a
+    move from 2% to 5% doesn't pass in silence. Needs no exit at all."""
+    only = store.get("only")
+    only_pct = only.get("pct")
+    if not only_pct:
+        return
+    fired_at = only.get("fired_at")
+    due = spread >= only_pct and (
+        not only.get("fired") or
+        (fired_at is not None and spread >= fired_at + ESCALATION_PCT)
+    )
+    if due:
+        store.update("only", fired=True, fired_at=round(spread, 3))
+        await push(f"KNTQ спред {_pct(spread)}",
+                   f"Поріг {only_pct:.2f}%. ${cfg.notional_usd:,.0f} → "
+                   f"{sell_used:,.2f} USDC на Elysium "
+                   f"({cfg.notional_usd * spread / 100:+,.0f}$ валом).",
+                   url=HYPE_SPOT_URL, url_title="Hype Spot")
+        await tg.send(
+            f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
+            f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
+            f"${cfg.notional_usd:,.0f} → {fill.qty:,.0f} KNTQ → "
+            f"<b>{sell_used:,.2f} USDC</b> на Elysium\n"
+            f"Валом {cfg.notional_usd * spread / 100:+,.0f}$ до вартості виходу.",
+            alert_buttons(None, sell_used),
+        )
+        log.info("ONLY alert sent at %+.2f%%", spread)
+    elif only.get("fired") and spread < (only_pct - cfg.clear_margin_pct):
+        store.update("only", fired=False, fired_at=None)
+        log.info("ONLY re-armed at %+.2f%%", spread)
+
+
+async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
+                      store: Store, tg: Telegram) -> None:
+    """Fast loop: spread only, every few seconds.
+
+    Two requests a round -- the HyperCore book and one Kyber quote -- and no
+    LI.FI at all. KyberSwap already routes through HYPE when that pays more,
+    so the direct quote is the traded number (measured equal to 0.000%).
+    When the spread nears the exit-alert threshold it wakes the full tick
+    rather than waiting out its two-minute cycle.
+    """
+    fails = 0
+    last_logged: float | None = None
+    last_log_ts = 0.0
+    while not _stop.is_set():
+        interval = rt.spread_poll_seconds
+        try:
+            fill = await core.buy_fill(cfg.notional_usd, cfg.taker_fee_pct)
+            q = None
+            if fill is not None and fill.filled:
+                q = await markets.quote_elysium(KNTQ_ELYSIUM, USDC_ELYSIUM,
+                                                str(int(fill.qty * 1e18)))
+            if q is None:
+                fails += 1
+            else:
+                fails = 0
+                sell_used = q[0] / 1e6
+                spread = 100.0 * (sell_used / fill.cost_usd - 1.0)
+                now = time.time()
+                _snapshot.update({"spread": spread, "spread_ts": now,
+                                  "buy_px": fill.avg_px, "depth": fill.book_depth_usd})
+                store.update("spread", last_pct=round(spread, 3))
+                await check_only(cfg, store, tg, spread, fill, sell_used)
+                if (spread >= rt.go_spread_pct - cfg.clear_margin_pct
+                        and now - _snapshot.get("tick_ts", 0) > 20):
+                    _wake.set()
+                if (last_logged is None or abs(spread - last_logged) >= 0.1
+                        or now - last_log_ts >= 60):
+                    log.info("fast spread %+.2f%% | buy %.5f | sell %.2f USDC",
+                             spread, fill.avg_px, sell_used)
+                    last_logged, last_log_ts = spread, now
+        except Exception as exc:  # noqa: BLE001 - a bad round must not kill the loop
+            fails += 1
+            log.warning("Fast spread round failed: %s", exc)
+        # Back off when a source is refusing us, recover as soon as it answers.
+        delay = interval if fails == 0 else min(60.0, interval * (2 ** min(fails, 4)))
+        try:
+            await asyncio.wait_for(_stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
                store: Store, tg: Telegram, tick_no: int) -> None:
     fill = await core.buy_fill(cfg.notional_usd, cfg.taker_fee_pct)
@@ -230,39 +318,6 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
 
     spread = 100.0 * (sell_used / fill.cost_usd - 1.0)
     store.update("spread", last_pct=round(spread, 3))
-
-    # --- /only: spread watch, fired before any exit probing so the push is
-    # immediate. Needs no exit, so it costs nothing against the LI.FI budget.
-    only = store.get("only")
-    only_pct = only.get("pct")
-    if only_pct:
-        # Fire on crossing the threshold, and again whenever the spread climbs
-        # another ESCALATION_PCT above wherever it last fired -- otherwise a
-        # move from 2% to 5% would pass in silence.
-        fired_at = only.get("fired_at")
-        due = spread >= only_pct and (
-            not only.get("fired") or
-            (fired_at is not None and spread >= fired_at + ESCALATION_PCT)
-        )
-        if due:
-            store.update("only", fired=True, fired_at=round(spread, 3))
-            await push(f"KNTQ спред {_pct(spread)}",
-                       f"Поріг {only_pct:.2f}%. ${cfg.notional_usd:,.0f} → "
-                       f"{sell_used:,.2f} USDC на Elysium "
-                       f"({cfg.notional_usd * spread / 100:+,.0f}$ валом).",
-                       priority=1, url=HYPE_SPOT_URL, url_title="Hype Spot")
-            await tg.send(
-                f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
-                f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
-                f"${cfg.notional_usd:,.0f} → {fill.qty:,.0f} KNTQ → "
-                f"<b>{sell_used:,.2f} USDC</b> на Elysium\n"
-                f"Валом {cfg.notional_usd * spread / 100:+,.0f}$ до вартості виходу.",
-                alert_buttons(None, sell_used),
-            )
-            log.info("ONLY alert sent at %+.2f%%", spread)
-        elif only.get("fired") and spread < (only_pct - cfg.clear_margin_pct):
-            store.update("only", fired=False, fired_at=None)
-            log.info("ONLY re-armed at %+.2f%%", spread)
 
     threshold = rt.go_spread_pct
     tell = store.get("tell")
@@ -302,6 +357,7 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
         "hype_direct": alt.usdc_out if alt and alt.carrier == "HYPE" else None,
     }
     _snapshot.update({
+        "tick_ts": time.time(),
         "test": t, "spread": spread, "buy_px": fill.avg_px,
         "depth": fill.book_depth_usd,
         "carrier": best.carrier if best else "-", "final": final,
@@ -328,8 +384,7 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
         if depth >= target:
             store.update("tell", armed=False)
             await push(f"Вихід відкрився: {best.chain}",
-                       f"{best.carrier} −{best.loss_pct:.2f}%, тримає ${depth:,.0f}",
-                       priority=1)
+                       f"{best.carrier} −{best.loss_pct:.2f}%, тримає ${depth:,.0f}")
             await tg.send(tell_message(best.chain, best.carrier, best.provider,
                                        best.loss_pct, best.usdc_out, depth,
                                        capped, target), buttons)
@@ -342,7 +397,7 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
             store.mark_alerted("go")
             await push(f"КОЛО ВІДКРИТЕ {_pct(t['net'])}",
                        f"Спред {_pct(spread)}, вихід {t['chain']} −{t['exit_loss']:.2f}%, "
-                       f"нетто {t['net_usd']:+,.0f}$", priority=1,
+                       f"нетто {t['net_usd']:+,.0f}$",
                        url=HYPE_SPOT_URL, url_title="Hype Spot")
             await tg.send(go_message(threshold, t, alt), buttons)
             log.info("GO sent: net %+.2f%% via %s", net, best.chain)
@@ -360,7 +415,7 @@ async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,
             line = (f"Найдешевший із {len(exits)}: {cheapest.chain} / {cheapest.carrier} "
                     f"−{cheapest.loss_pct:.2f}%." if cheapest else "Жодного маршруту.")
             await push(f"Широкий спред {_pct(spread)}", "Виходу немає. " + line,
-                       priority=1, url=BRIDGE_URL, url_title="Bridge")
+                       url=BRIDGE_URL, url_title="Bridge")
             await tg.send(
                 f"🟠 <b>ШИРОКИЙ СПРЕД</b> {_pct(spread)} — виходу немає\n\n"
                 f"${cfg.notional_usd:,.0f} → {sell_used:,.2f} USDC на Elysium.\n{line}",
@@ -388,6 +443,7 @@ async def monitor_loop(cfg, rt, core, markets, store, tg) -> None:
         if now - last_flush >= cfg.flush_seconds:
             try:
                 await store.flush()
+                await store.reload_settings()
             except Exception as exc:  # noqa: BLE001
                 log.error("Redis flush failed (%s); state kept in memory", exc)
             last_flush = now
@@ -404,8 +460,11 @@ async def monitor_loop(cfg, rt, core, markets, store, tg) -> None:
             last_heartbeat = now
 
         elapsed = time.monotonic() - started
+        _wake.clear()
         try:
-            await asyncio.wait_for(_stop.wait(), timeout=max(1.0, cfg.poll_seconds - elapsed))
+            await asyncio.wait_for(_wake.wait(), timeout=max(1.0, cfg.poll_seconds - elapsed))
+            if not _stop.is_set():
+                log.info("full tick woken early by the fast spread loop")
         except asyncio.TimeoutError:
             pass
 
@@ -433,7 +492,7 @@ async def run() -> int:
         tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http)
         rt = Runtime(cfg, store)
         global _push
-        _push = Pushover(cfg.pushover_app_token, http, store)
+        _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
         commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push)
 
         await tg.send(
@@ -444,6 +503,7 @@ async def run() -> int:
             f"<code>/pushover USER_KEY</code> — підключити свій Pushover (кожен свій)\n"
             f"<code>/allow</code> у відповідь на повідомлення — дати доступ другу\n"
             f"<code>/myid</code> — показати свій ID\n"
+            f"<code>/poll 5</code> — як часто перевіряти спред, секунд\n"
             f"<code>/spread 2.5%</code> — поріг для алерта з виходом\n"
             f"<code>/tell</code> — сповістити, коли з'явиться пул на "
             f"${cfg.notional_usd:,.0f}\n"
@@ -455,6 +515,7 @@ async def run() -> int:
 
         tasks = [
             asyncio.create_task(monitor_loop(cfg, rt, core, markets, store, tg)),
+            asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg)),
             asyncio.create_task(commands.run(_stop)),
         ]
         await _stop.wait()

@@ -65,6 +65,8 @@ trustworthy — a spot mark would quietly decide the answer.
 | `/pulls` | Routes that can take the money out under `MAX_EXIT_LOSS_PCT`, with how much each can absorb. |
 | `/status` | Latest spread, fill price, chosen carrier, best exit. |
 | `/only 2` | Spread watch only, no exit needed. Pushes via Pushover, re-fires every +1%. `/only off` stops it. |
+| `/poll 5` | How often the fast loop checks the spread, 3–120 s. Default 10. |
+| `/allow` / `/deny` | Owner only: reply to someone's message to grant or revoke command access. `/myid` shows your id. |
 | `/pushover USER_KEY` | Connect Pushover. The bot deletes the message carrying the key. `/pushover test`, `/pushover off`. |
 
 `/spread` and `/pulls` are limited to `TELEGRAM_ADMIN_ID` when it is set.

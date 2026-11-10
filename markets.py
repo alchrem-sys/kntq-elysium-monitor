@@ -36,6 +36,7 @@ from config import (
 log = logging.getLogger("markets")
 
 KYBER_BASE = "https://aggregator-api.kyberswap.com/elysium/api/v1"
+KYBER_HEADERS = {"x-client-id": "kntq-elysium-monitor"}
 RELAY_QUOTE = "https://api.relay.link/quote"
 
 # carrier -> (kyber sell-to token, lifi/relay origin token, decimals)
@@ -95,7 +96,7 @@ class Markets:
         for attempt in range(3):
             try:
                 self.other_requests += 1
-                r = await self.http.get(f"{KYBER_BASE}/routes", params=params)
+                r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
                 if r.is_success:
                     s = (r.json().get("data") or {}).get("routeSummary") or {}
                     if not s.get("amountOut"):
@@ -119,7 +120,7 @@ class Markets:
         for attempt in range(3):
             try:
                 self.other_requests += 1
-                r = await self.http.get(f"{KYBER_BASE}/routes", params=params)
+                r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
                 if r.is_success:
                     summary = (r.json().get("data") or {}).get("routeSummary") or {}
                     if not summary.get("amountOut"):

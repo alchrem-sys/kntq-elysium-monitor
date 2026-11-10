@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 
 import httpx
 
@@ -24,11 +25,14 @@ log = logging.getLogger("commands")
 SPREAD_RE = re.compile(r"^/spread(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 PULLS_RE = re.compile(r"^/pulls(?:@\S+)?\s*$", re.I)
 STATUS_RE = re.compile(r"^/status(?:@\S+)?\s*$", re.I)
-TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
+TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
 TEST_RE = re.compile(r"^/test(?:@\S+)?\s*$", re.I)
-PUSHOVER_RE = re.compile(r"^/pushover(?:@\S+)?(?:\s+(\S+))?\s*$", re.I)
+# Telegram sends messages from anonymous group admins as this user.
+ANON_ADMIN_ID = "1087968824"
+PUSHOVER_RE = re.compile(r"^/pushover(?:@\S+)?(?:\s+(\S+))?(?:\s+(\S+))?\s*$", re.I)
 ALLOW_RE = re.compile(r"^/(allow|deny)(?:@\S+)?(?:\s+(\d+))?\s*$", re.I)
 MYID_RE = re.compile(r"^/myid(?:@\S+)?\s*$", re.I)
+POLL_RE = re.compile(r"^/poll(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+))?\s*$", re.I)
 ONLY_RE = re.compile(r"^/only(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 
 # Ladder used to measure how much a route can absorb before it stops clearing
@@ -43,8 +47,18 @@ class Runtime:
     def __init__(self, cfg: Config, store):
         self.cfg = cfg
         self.store = store
-        saved = store.get("runtime").get("go_spread_pct")
+        rec = store.get("runtime")
+        saved = rec.get("go_spread_pct")
         self.go_spread_pct: float = float(saved) if saved else cfg.go_spread_pct
+        self._poll = rec.get("spread_poll_seconds")
+
+    @property
+    def spread_poll_seconds(self) -> float:
+        saved = self.store.get("runtime").get("spread_poll_seconds")
+        return float(saved) if saved else self.cfg.spread_poll_seconds
+
+    def set_poll(self, seconds: float) -> None:
+        self.store.update("runtime", spread_poll_seconds=seconds)
 
     def set_go_spread(self, pct: float) -> None:
         self.go_spread_pct = pct
@@ -62,6 +76,7 @@ class CommandServer:
         self.tg = tg
         self.snapshot = snapshot          # callable -> dict of latest tick data
         self.pushover = pushover
+        self._denied: dict[str, float] = {}
         self._offset: int | None = None
         self._base = f"https://api.telegram.org/bot{cfg.telegram_token}"
 
@@ -106,43 +121,110 @@ class CommandServer:
                 log.exception("Command loop error: %s", exc)
                 await asyncio.sleep(5)
 
+    async def _deny(self, msg: dict, uid: str, name: str) -> None:
+        """Say why a command was refused, at most once per person per 10 min.
+
+        Silence made a missing grant indistinguishable from a broken bot.
+        """
+        now = time.monotonic()
+        last = self._denied.get(uid)
+        if last is not None and now - last < 600:
+            return
+        self._denied[uid] = now
+        if uid == ANON_ADMIN_ID or msg.get("sender_chat"):
+            await self.tg.send(
+                "⛔ Ти пишеш анонімно, від імені групи — бот не бачить, хто ти.\n"
+                "Налаштування групи → Адміністратори → ти → вимкни "
+                "«Remain anonymous / Анонімність»."
+            )
+            return
+        await self.tg.send(
+            f"⛔ {name}, у тебе немає доступу до команд. Твій ID: <code>{uid}</code>\n"
+            f"Власник має відповісти <code>/allow</code> на твоє повідомлення."
+        )
+
     async def _dispatch(self, text: str, msg: dict) -> None:
+        sender = msg.get("from") or {}
+        uid = str(sender.get("id"))
+        name = sender.get("first_name") or uid
+        cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+        if not cmd:
+            return
+
+        async def gate() -> bool:
+            ok = self._is_admin(msg)
+            log.info("cmd %s from %s (%s) -> %s", cmd, uid, name, "ok" if ok else "DENIED")
+            if not ok:
+                await self._deny(msg, uid, name)
+            return ok
+
+        changed = False
         if m := SPREAD_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_spread(m.group(1))
+            if await gate():
+                await self._cmd_spread(m.group(1))
+                changed = True
         elif PULLS_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_pulls()
+            if await gate():
+                await self._cmd_pulls()
         elif m := TELL_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_tell(m.group(1))
+            if await gate():
+                await self._cmd_tell(m.group(1))
+                changed = True
         elif TEST_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_test()
+            if await gate():
+                await self._cmd_test()
         elif MYID_RE.match(text):
-            u = msg.get("from") or {}
-            await self.tg.send(f"{u.get('first_name', '')}: <code>{u.get('id')}</code>")
+            log.info("cmd /myid from %s (%s)", uid, name)
+            await self.tg.send(f"{name}: <code>{uid}</code>")
         elif m := ALLOW_RE.match(text):
-            if not self._is_owner(msg):
-                return
-            await self._cmd_allow(m.group(1).lower(), m.group(2), msg)
+            ok = self._is_owner(msg)
+            log.info("cmd /%s from %s (%s) -> %s", m.group(1), uid, name,
+                     "ok" if ok else "DENIED (owner only)")
+            if ok:
+                await self._cmd_allow(m.group(1).lower(), m.group(2), msg)
+                changed = True
+            else:
+                await self.tg.send("Доступ видає тільки власник бота.")
         elif m := PUSHOVER_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_pushover(m.group(1), msg)
+            if await gate():
+                await self._cmd_pushover(m.group(1), msg, m.group(2))
+                changed = True
+        elif m := POLL_RE.match(text):
+            if await gate():
+                await self._cmd_poll(m.group(1))
+                changed = True
         elif m := ONLY_RE.match(text):
-            if not self._is_admin(msg):
-                return
-            await self._cmd_only(m.group(1))
+            if await gate():
+                await self._cmd_only(m.group(1))
+                changed = True
         elif STATUS_RE.match(text):
             await self._cmd_status()
 
+        if changed:
+            try:
+                await self.store.save_settings()
+            except Exception as exc:  # noqa: BLE001
+                log.error("Could not save settings: %s", exc)
+
+    async def _cmd_poll(self, value: str | None) -> None:
+        if value is None:
+            await self.tg.send(
+                f"Спред перевіряю кожні <b>{self.runtime.spread_poll_seconds:g} с</b>.\n"
+                f"Змінити: <code>/poll 5</code> (від 3 до 120)")
+            return
+        sec = float(value)
+        if not 3 <= sec <= 120:
+            await self.tg.send("Інтервал має бути від 3 до 120 секунд.")
+            return
+        self.runtime.set_poll(sec)
+        await self.tg.send(f"⏱ Тепер перевіряю спред кожні <b>{sec:g} с</b>.")
+
     async def _cmd_tell(self, value: str | None) -> None:
         """Arm a one-shot watch for an exit that can absorb a given size."""
+        if value and value.lower() == "off":
+            self.store.update("tell", armed=False)
+            await self.tg.send("🔕 /tell знято.")
+            return
         size = float(value) if value else self.cfg.notional_usd
         if size < 100:          # "/tell 3" means 3k
             size *= 1000
@@ -164,7 +246,8 @@ class CommandServer:
         except Exception:  # noqa: BLE001
             return False
 
-    async def _cmd_pushover(self, value: str | None, msg: dict) -> None:
+    async def _cmd_pushover(self, value: str | None, msg: dict,
+                            arg: str | None = None) -> None:
         po = self.pushover
         if po is None:
             await self.tg.send("Pushover не підключено в цій збірці.")
@@ -176,22 +259,37 @@ class CommandServer:
             who = ", ".join(f"…{k[-4:]}" for k in users.values()) or "<b>нікого</b>"
             await self.tg.send(
                 f"Pushover: app token {'є' if po.app_token else '<b>немає</b> (PUSHOVER_APP_TOKEN)'}\n"
-                f"Підключено: {who}\n"
+                f"Підключено: {who} · пріоритет {po.priority}\n"
                 f"Кожен підключає свій ключ сам.\n"
                 f"<code>/pushover USER_KEY</code> — задати · "
                 f"<code>/pushover test</code> — перевірити · "
-                f"<code>/pushover off</code> — вимкнути")
+                f"<code>/pushover off</code> — вимкнути · "
+                f"<code>/pushover priority 2</code> — екстрений")
             return
         low = value.lower()
         if low == "off":
             po.set_user(uid, None)
             await self.tg.send(f"🔕 Pushover для {name} вимкнено.")
             return
+        if low == "priority":
+            names = {0: "звичайний", 1: "високий", 2: "екстрений (повторює до підтвердження)"}
+            if arg is None:
+                await self.tg.send(f"Пріоритет пушів: <b>{po.priority}</b> — {names.get(po.priority, '?')}\n"
+                                   f"<code>/pushover priority 1</code> високий · "
+                                   f"<code>/pushover priority 2</code> екстрений")
+                return
+            if arg not in ("0", "1", "2"):
+                await self.tg.send("Пріоритет: 0, 1 або 2.")
+                return
+            po.set_priority(int(arg))
+            await self.tg.send(f"✅ Пріоритет пушів: <b>{arg}</b> — {names[int(arg)]}")
+            return
         if low == "test":
             if not po.ready:
                 await self.tg.send("Спочатку задай ключ: <code>/pushover USER_KEY</code>")
                 return
-            ok = await po.send("KNTQ monitor", f"Тестовий пуш від {name} — усе працює ✅", priority=0)
+            ok = await po.send("KNTQ monitor", f"Тестовий пуш від {name} — усе працює ✅ "
+                                                f"(пріоритет {po.priority})")
             await self.tg.send("✅ Пуш відправлено" if ok else "❌ Pushover відхилив запит, глянь логи")
             return
         deleted = await self._delete(msg)
@@ -200,7 +298,8 @@ class CommandServer:
             await self.tg.send(f"❌ Ключ не прийнято: {info}")
             return
         po.set_user(uid, value)
-        await po.send("KNTQ monitor", "Pushover підключено ✅", priority=0, only=uid)
+        await po.send("KNTQ monitor", "Pushover підключено ✅",
+                      priority=min(po.priority, 1), only=uid)
         await self.tg.send(
             f"✅ {name}: Pushover підключено, ключ …{value[-4:]}, пристрої: {info}\n"
             + ("Повідомлення з ключем видалив." if deleted

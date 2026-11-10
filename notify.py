@@ -53,10 +53,12 @@ class Pushover:
     URL = "https://api.pushover.net/1/messages.json"
     VALIDATE_URL = "https://api.pushover.net/1/users/validate.json"
 
-    def __init__(self, app_token: str, http: httpx.AsyncClient, store):
+    def __init__(self, app_token: str, http: httpx.AsyncClient, store,
+                 default_priority: int = 1):
         self.app_token = app_token
         self.http = http
         self.store = store
+        self.default_priority = default_priority
 
     def users(self) -> dict[str, str]:
         """Telegram user id -> Pushover user key, one per person in the group."""
@@ -65,6 +67,15 @@ class Pushover:
         if rec.get("user"):            # single key saved by the previous build
             users.setdefault("legacy", rec["user"])
         return users
+
+    @property
+    def priority(self) -> int:
+        """Configured Pushover priority: 1 high (default), 2 emergency, 0 normal."""
+        saved = self.store.get("pushover").get("priority")
+        return int(saved) if saved is not None else self.default_priority
+
+    def set_priority(self, value: int) -> None:
+        self.store.update("pushover", priority=int(value))
 
     def set_user(self, tg_id: str, key: str | None) -> None:
         users = {k: v for k, v in self.users().items() if k != "legacy"}
@@ -91,12 +102,18 @@ class Pushover:
             return True, ", ".join(j.get("devices") or []) or "усі пристрої"
         return False, "; ".join(j.get("errors") or ["невідома помилка"])
 
-    async def send(self, title: str, message: str, priority: int = 1,
+    async def send(self, title: str, message: str, priority: int | None = None,
                    url: str | None = None, url_title: str | None = None,
                    only: str | None = None) -> bool:
-        """Push to every connected person, or just `only` (a Telegram id)."""
+        """Push to every connected person, or just `only` (a Telegram id).
+
+        `priority` None means the configured one, so tests and alerts look
+        exactly alike on the phone.
+        """
         if not self.app_token:
             return False
+        if priority is None:
+            priority = self.priority
         users = self.users()
         if only is not None:
             users = {k: v for k, v in users.items() if k == only}
@@ -108,6 +125,10 @@ class Pushover:
                         url: str | None, url_title: str | None) -> bool:
         data = {"token": self.app_token, "user": user_key, "title": title,
                 "message": message, "priority": priority, "html": 1}
+        if priority >= 2:
+            # Emergency: Pushover repeats it every `retry` seconds until it is
+            # acknowledged on the phone or `expire` runs out.
+            data.update(retry=30, expire=600)
         if url:
             data["url"] = url
             data["url_title"] = url_title or url

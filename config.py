@@ -177,6 +177,7 @@ class Config:
     telegram_chat_id: str
     telegram_admin_ids: frozenset[str]
     pushover_app_token: str
+    pushover_priority: int
     redis_url: str
     lifi_api_key: str
     lifi_base: str
@@ -205,6 +206,7 @@ class Config:
     heartbeat_seconds: float = 900.0
     http_timeout: float = 25.0
     command_poll_seconds: float = 25.0   # Telegram long-poll timeout
+    spread_poll_seconds: float = 10.0    # fast spread-only loop
 
 
 def load() -> Config:
@@ -222,6 +224,7 @@ def load() -> Config:
             x.strip() for x in os.getenv("TELEGRAM_ADMIN_ID", "").split(",") if x.strip()
         ),
         pushover_app_token=os.getenv("PUSHOVER_APP_TOKEN", "").strip(),
+        pushover_priority=int(_num("PUSHOVER_PRIORITY", 1)),
         redis_url=_req("REDIS_URL"),
         lifi_api_key=os.getenv("LIFI_API_KEY", "").strip(),
         lifi_base=os.getenv("LIFI_BASE_URL", "https://li.quest/v1").rstrip("/"),
@@ -243,6 +246,7 @@ def load() -> Config:
         spacing_seconds=_num("REQUEST_SPACING_SECONDS", 2.0),
         alert_cooldown_seconds=_num("ALERT_COOLDOWN_SECONDS", 600.0),
         flush_seconds=_num("FLUSH_SECONDS", 300.0),
+        spread_poll_seconds=_num("SPREAD_POLL_SECONDS", 10.0),
     )
 
 
