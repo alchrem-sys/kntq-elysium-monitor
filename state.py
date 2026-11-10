@@ -63,7 +63,10 @@ class Store:
         if not payload:
             self._dirty = False
             return
-        pipe = self._redis.pipeline()
+        # transaction=False: Upstash rejects MULTI/EXEC ("no permissions to run
+        # the 'exec' command"). These two writes need no atomicity anyway --
+        # worst case the TTL is refreshed a moment after the data.
+        pipe = self._redis.pipeline(transaction=False)
         pipe.hset(KEY, mapping=payload)
         pipe.expire(KEY, TTL_SECONDS)
         await pipe.execute()
