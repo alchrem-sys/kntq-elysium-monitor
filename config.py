@@ -30,6 +30,36 @@ HYPERCORE_KNTQ_USDC = "@334"
 KYBER_NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 LIFI_NATIVE = "0x0000000000000000000000000000000000000000"
 
+# Buttons attached to every alert, so the three legs are one tap each.
+HYPE_SPOT_URL = "https://app.hyperliquid.xyz/trade/KNTQ/USDC"
+BRIDGE_URL = (
+    "https://elysium.kinetiq.xyz/bridge"
+    "?tokenIn=1337:0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE:124"
+)
+
+
+def jumper_url(to_chain: int, amount: float) -> str:
+    """Jumper, pre-filled for the chain that currently has an open exit."""
+    to_token = USDC_BY_CHAIN.get(to_chain, "")
+    return (
+        f"https://jumper.xyz/?fromAmount={amount:.0f}"
+        f"&fromChain={ELYSIUM_CHAIN_ID}&fromToken={USDC_ELYSIUM}"
+        f"&toChain={to_chain}&toToken={to_token}"
+    )
+
+
+def alert_buttons(to_chain: int | None, amount: float) -> list[list[dict]]:
+    rows = [[
+        {"text": "Hype Spot", "url": HYPE_SPOT_URL},
+        {"text": "Bridge", "url": BRIDGE_URL},
+    ]]
+    if to_chain is not None:
+        rows.append([{
+            "text": f"Jumper → {CHAIN_NAMES.get(to_chain, to_chain)}",
+            "url": jumper_url(to_chain, amount),
+        }])
+    return rows
+
 # Every EVM mainnet LI.FI lists a USDC for, 2026-11-10. Testnets excluded.
 # Destination decimals are read from each quote, so BSC's 18-decimal USDC
 # needs no special case here.

@@ -87,6 +87,26 @@ class Markets:
 
     # ---------- Elysium sell side ----------
 
+    async def quote_elysium(self, token_in: str, token_out: str,
+                            raw_amount: str) -> tuple[int, int] | None:
+        """Raw Kyber quote on Elysium. Returns (amount_out_raw, hops)."""
+        params = {"tokenIn": token_in, "tokenOut": token_out,
+                  "amountIn": raw_amount, "gasInclude": "true"}
+        for attempt in range(3):
+            try:
+                self.other_requests += 1
+                r = await self.http.get(f"{KYBER_BASE}/routes", params=params)
+                if r.is_success:
+                    s = (r.json().get("data") or {}).get("routeSummary") or {}
+                    if not s.get("amountOut"):
+                        return None
+                    return int(s["amountOut"]), len(s.get("route") or [])
+                log.warning("Kyber %s: %s", r.status_code, r.text[:140])
+            except httpx.HTTPError as exc:
+                log.warning("Kyber transport error (%s), attempt %d", exc, attempt + 1)
+            await _backoff(attempt)
+        return None
+
     async def sell_kntq(self, qty: float, carrier: str) -> Sale | None:
         """What `qty` KNTQ fetches in `carrier` on Elysium, across every pool."""
         to_token, _, decimals = CARRIERS[carrier]

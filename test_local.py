@@ -2,9 +2,9 @@
 
 The build sandbox has no egress to api.hyperliquid.xyz, li.quest or kyberswap,
 so the HTTP boundary is stubbed with numbers those services actually returned
-on 2026-11-10: the real @334 ask book, the real KNTQ sell quotes into both
-carriers, and exit costs in the range measured that evening. Everything below
-the HTTP layer is production code.
+on 2026-11-10: the real @334 ask book, real KNTQ sell quotes, and exit costs
+in the range measured that evening. Everything below the HTTP layer is
+production code.
 """
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ ASKS = [
     {"px": "0.33893", "sz": "17456.49"},
 ]
 MID = 71.7145
-PX_USDC = 3070.24 / 9000          # KNTQ -> USDC, measured
-PX_HYPE = 43.2537 / 9000          # KNTQ -> HYPE, measured
+PX_USDC = 3105.506166 / 9000       # KNTQ -> USDC, measured
+PX_HYPE = 43.39677515 / 9000       # KNTQ -> HYPE, measured
 
 W = {"mult": 1.0, "exit": {("USDC", 10): 0.27, ("HYPE", 10): 0.76}, "default": 3.02}
 
@@ -64,18 +64,25 @@ class FakeHttp:
         if "relay.link" in url:
             return R({"details": {"currencyOut": {"amountFormatted": "1"}, "timeEstimate": 2}})
         if "telegram" in url:
-            self.sent.append(json["text"])
+            self.sent.append(json)
             return R({"ok": True})
         return R({}, 404)
 
     async def get(self, url, params=None, headers=None, **kw):
         if "kyberswap" in url:
-            qty = int(params["amountIn"]) / 1e18
-            if params["tokenOut"].lower().startswith("0xeeee"):
+            tin, tout = params["tokenIn"].lower(), params["tokenOut"].lower()
+            amt = int(params["amountIn"])
+            if tin.startswith("0xeeee"):                 # HYPE -> USDC
+                usd = amt / 1e18 * MID * 0.99962         # same as the direct quote
                 return R({"data": {"routeSummary": {
-                    "amountOut": str(int(qty * PX_HYPE * W["mult"] * 1e18)), "route": [1, 2]}}})
-            return R({"data": {"routeSummary": {
-                "amountOut": str(int(qty * PX_USDC * W["mult"] * 1e6)), "route": [1, 2, 3]}}})
+                    "amountOut": str(int(usd * 1e6)), "route": [1, 2]}}})
+            if tout.startswith("0xeeee"):                # KNTQ -> HYPE
+                return R({"data": {"routeSummary": {
+                    "amountOut": str(int(amt / 1e18 * PX_HYPE * W["mult"] * 1e18)),
+                    "route": [1, 2, 3, 4]}}})
+            return R({"data": {"routeSummary": {         # KNTQ -> USDC
+                "amountOut": str(int(amt / 1e18 * PX_USDC * W["mult"] * 1e6)),
+                "route": [1] * 7}}})
         if "li.quest" in url:
             chain = int(params["toChain"])
             carrier = "HYPE" if params["fromToken"].startswith("0x0000") else "USDC"
@@ -117,12 +124,19 @@ class TG:
     def __init__(self, h):
         self.http = h
 
-    async def send(self, text):
-        print("\n" + "=" * 62)
+    async def send(self, text, buttons=None):
+        print("\n" + "=" * 64)
         for t in ("<b>", "</b>", "<code>", "</code>"):
             text = text.replace(t, "")
         print(text)
-        print("=" * 62)
+        if buttons:
+            print("-" * 64)
+            for row in buttons:
+                print("  [" + "]  [".join(f"{b['text']}" for b in row) + "]")
+            for row in buttons:
+                for b in row:
+                    print(f"    {b['text']}: {b['url'][:110]}")
+        print("=" * 64)
         return True
 
 
@@ -133,34 +147,25 @@ async def main() -> None:
     tg = TG(http)
     rt = Runtime(cfg, store)
     cmds = CommandServer(cfg, http, markets, store, rt, tg, snapshot)
-    print(f"Chains: {len(cfg.chains)}  carriers: USDC, HYPE  threshold: {rt.go_spread_pct}%")
 
-    print("\n### 1. Spread ~1% -> silence, no exit probes")
+    print("### 1. Quiet spread -> silence")
     await tick(cfg, rt, core, markets, store, tg, 1)
 
-    print("\n### 2. Spread lifted above 3%: HYPE sells 1% better, USDC exits cheaper")
-    print("        -> decision must be made on USDC actually delivered")
-    W["mult"] = 1.025
+    print("\n### 2. /tell armed, waiting for a $3k exit")
+    await cmds._cmd_tell(None)
+
+    print("\n### 3. Spread lifts above 3% -> TELL fires, then GO with buttons")
+    W["mult"] = 1.03
     await tick(cfg, rt, core, markets, store, tg, 2)
 
-    print("\n### 3. /spread 1.5% -> threshold lowered and persisted")
-    await cmds._cmd_spread("1.5")
+    print("\n### 4. /test -- the full working, in English")
+    await cmds._cmd_test()
 
-    print("\n### 4. Back to ~3.5% spread with the lower threshold still armed")
+    print("\n### 5. /tell must not fire twice")
     store.data["go"]["armed"] = False
     await tick(cfg, rt, core, markets, store, tg, 3)
 
-    print("\n### 5. /pulls -> only routes under 1%, with depth")
-    await cmds._cmd_pulls()
-
-    print("\n### 6. Spread 6%, every chain drained -> URGENT")
-    W["mult"] = 1.06
-    W["exit"] = {}
-    store.data.clear()
-    rt2 = Runtime(cfg, store)
-    await tick(cfg, rt2, core, markets, store, tg, 4)
-
-    print(f"\nLI.FI requests: {markets.lifi_requests}")
+    print(f"\nTelegram payloads: {len(http.sent)}  LI.FI requests: {markets.lifi_requests}")
 
 
 if __name__ == "__main__":

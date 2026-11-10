@@ -16,18 +16,19 @@ class Telegram:
         self._chat_id = chat_id
         self.http = http
 
-    async def send(self, text: str) -> bool:
+    async def send(self, text: str, buttons: list[list[dict]] | None = None) -> bool:
+        """Send a message. `buttons` is an inline keyboard of {text, url} rows."""
+        payload: dict = {
+            "chat_id": self._chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": buttons}
         for attempt in range(3):
             try:
-                r = await self.http.post(
-                    self._url,
-                    json={
-                        "chat_id": self._chat_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
+                r = await self.http.post(self._url, json=payload)
                 if r.is_success:
                     return True
                 log.warning("Telegram %s: %s", r.status_code, r.text[:200])

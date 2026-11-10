@@ -24,6 +24,8 @@ log = logging.getLogger("commands")
 SPREAD_RE = re.compile(r"^/spread(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 PULLS_RE = re.compile(r"^/pulls(?:@\S+)?\s*$", re.I)
 STATUS_RE = re.compile(r"^/status(?:@\S+)?\s*$", re.I)
+TELL_RE = re.compile(r"^/tell(?:@\S+)?(?:\s+([0-9]*\.?[0-9]+)\s*[kK]?)?\s*$", re.I)
+TEST_RE = re.compile(r"^/test(?:@\S+)?\s*$", re.I)
 
 # Ladder used to measure how much a route can absorb before it stops clearing
 # the threshold. The cost curve is a cliff, not a slope, so a handful of rungs
@@ -101,8 +103,72 @@ class CommandServer:
             if not self._is_admin(msg):
                 return
             await self._cmd_pulls()
+        elif m := TELL_RE.match(text):
+            if not self._is_admin(msg):
+                return
+            await self._cmd_tell(m.group(1))
+        elif TEST_RE.match(text):
+            if not self._is_admin(msg):
+                return
+            await self._cmd_test()
         elif STATUS_RE.match(text):
             await self._cmd_status()
+
+    async def _cmd_tell(self, value: str | None) -> None:
+        """Arm a one-shot watch for an exit that can absorb a given size."""
+        size = float(value) if value else self.cfg.notional_usd
+        if size < 100:          # "/tell 3" means 3k
+            size *= 1000
+        self.store.update("tell", armed=True, min_usd=size)
+        await self.tg.send(
+            f"🔔 Стежу за виходом щонайменше на <b>${size:,.0f}</b>.\n"
+            f"Прилетить одне повідомлення, щойно такий з'явиться: мережа, "
+            f"маршрут, ціна і скільки він тримає.\n"
+            f"Потім зніметься сам — викличеш <code>/tell</code> ще раз, якщо треба."
+        )
+
+    async def _cmd_test(self) -> None:
+        """Full working, in English, so the arithmetic can be checked by hand."""
+        snap = self.snapshot() or {}
+        if not snap.get("test"):
+            await self.tg.send("No completed tick yet — wait for the first one.")
+            return
+        t = snap["test"]
+        lines = [
+            "<b>CYCLE BREAKDOWN</b>  (all figures from the last tick)",
+            "",
+            f"<b>1. Buy on HyperCore spot</b>  KNTQ/USDC @334",
+            f"    spend            {t['notional']:>12,.2f} USDC",
+            f"    taker fee        {t['fee_pct']:>12.3f} %",
+            f"    walked the book, avg fill {t['buy_px']:.6f}",
+            f"    ask depth        {t['book_depth']:>12,.0f} USD",
+            f"    received         {t['qty']:>12,.2f} KNTQ",
+            "",
+            f"<b>2. Bridge to Elysium</b>  canonical, 1:1, gas only",
+            f"    KNTQ on Elysium  {t['qty']:>12,.2f}",
+            "",
+            f"<b>3. Sell on Elysium</b>  KyberSwap, every pool",
+            f"    via HYPE         {t['hype_out']:>12,.4f} HYPE  ({t['hype_hops']} hops)",
+            f"    HYPE -> USDC     {t['two_step']:>12,.2f} USDC  ({t['two_hops']} hops)",
+            f"    direct -> USDC   {t['direct']:>12,.2f} USDC  ({t['direct_hops']} hops)",
+            f"    using            {t['sell_used']:>12,.2f} USDC  ({t['sell_note']})",
+            "",
+            f"<b>4. Exit to {t['chain']}</b>",
+            f"    provider         {t['provider']:>12}",
+            f"    cost             {t['exit_loss']:>12.2f} %",
+            f"    delivered        {t['final']:>12,.2f} USDC",
+            "",
+            "<b>RESULT</b>",
+            f"    in               {t['notional']:>12,.2f} USDC",
+            f"    out              {t['final']:>12,.2f} USDC",
+            f"    gross spread     {t['spread']:>12.2f} %   (step 1 -> 3)",
+            f"    exit cost        {-t['exit_loss']:>12.2f} %   (step 4)",
+            f"    <b>net          {t['net']:>12.2f} %   {t['net_usd']:+,.2f} USD</b>",
+        ]
+        if t.get("hype_direct"):
+            lines += ["", f"Bridging HYPE itself instead would deliver "
+                          f"{t['hype_direct']:,.2f} USDC."]
+        await self.tg.send("\n".join(lines))
 
     async def _cmd_spread(self, value: str | None) -> None:
         if value is None:
