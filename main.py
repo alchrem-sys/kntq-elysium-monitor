@@ -57,8 +57,9 @@ from markets import Exit, Markets, RateLimited
 from notify import Pushover, Telegram
 from routing import exit_order, remember
 from state import Store
+from whales import WhaleWatch
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -493,7 +494,8 @@ async def run() -> int:
         rt = Runtime(cfg, store)
         global _push
         _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
-        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push)
+        whales = WhaleWatch(store, tg, _push, http)
+        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push, whales)
 
         await tg.send(
             f"▶️ <b>Монітор KNTQ Elysium</b>  v{VERSION}\n"
@@ -509,7 +511,9 @@ async def run() -> int:
             f"${cfg.notional_usd:,.0f}\n"
             f"<code>/pulls</code> — де зараз можна вийти, з глибиною\n"
             f"<code>/test</code> — повний розрахунок, англійською\n"
-            f"<code>/status</code> — поточний стан",
+            f"<code>/status</code> — поточний стан\n"
+            f"<code>/whales</code> — кити KNTQ: пуш, коли продають від "
+            f"${whales.min_usd:,.0f}",
             alert_buttons(None, cfg.notional_usd),
         )
 
@@ -517,6 +521,7 @@ async def run() -> int:
             asyncio.create_task(monitor_loop(cfg, rt, core, markets, store, tg)),
             asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg)),
             asyncio.create_task(commands.run(_stop)),
+            asyncio.create_task(whales.run(_stop)),
         ]
         await _stop.wait()
         for task in tasks:
