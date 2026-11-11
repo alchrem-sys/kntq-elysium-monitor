@@ -67,6 +67,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("monitor")
+# httpx logs every request URL at INFO, and Telegram URLs carry the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _stop = asyncio.Event()
 _wake = asyncio.Event()   # fast loop asks the full tick to run now
