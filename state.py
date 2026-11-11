@@ -26,7 +26,7 @@ TTL_SECONDS = 60 * 60 * 24 * 30
 # moment it changes: during a redeploy two instances overlap for a few
 # seconds, and a periodic flush of the whole blob from the old one used to
 # overwrite an /allow or a Pushover key received by the new one.
-SETTINGS_FIELDS = frozenset({"access", "pushover", "only", "runtime", "tell", "whales"})
+SETTINGS_FIELDS = frozenset({"access", "pushover", "only", "runtime", "tell", "whales", "pin"})
 
 
 class Store:

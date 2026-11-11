@@ -19,6 +19,7 @@ import httpx
 from config import Config
 from markets import Markets, RateLimited
 from routing import exit_order, remember
+from pin import PIN_RE
 from whales import WHALE_RE
 
 log = logging.getLogger("commands")
@@ -68,7 +69,7 @@ class Runtime:
 
 class CommandServer:
     def __init__(self, cfg: Config, http: httpx.AsyncClient, markets: Markets,
-                 store, runtime: Runtime, tg, snapshot, pushover=None, whales=None):
+                 store, runtime: Runtime, tg, snapshot, pushover=None, whales=None, pin=None):
         self.cfg = cfg
         self.http = http
         self.markets = markets
@@ -78,6 +79,7 @@ class CommandServer:
         self.snapshot = snapshot          # callable -> dict of latest tick data
         self.pushover = pushover
         self.whales = whales
+        self.pin = pin
         self._denied: dict[str, float] = {}
         self._offset: int | None = None
         self._base = f"https://api.telegram.org/bot{cfg.telegram_token}"
@@ -201,6 +203,9 @@ class CommandServer:
                 changed = True
         elif STATUS_RE.match(text):
             await self._cmd_status()
+        elif (m := PIN_RE.match(text)) and self.pin is not None:
+            if await gate():
+                changed = await self.pin.command(m.group(1))
         elif (m := WHALE_RE.match(text)) and self.whales is not None:
             if await gate():
                 changed = await self.whales.command(m.group(2))

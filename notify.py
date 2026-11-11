@@ -12,9 +12,19 @@ log = logging.getLogger("notify")
 
 class Telegram:
     def __init__(self, token: str, chat_id: str, http: httpx.AsyncClient):
-        self._url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self._base = f"https://api.telegram.org/bot{token}"
+        self._url = f"{self._base}/sendMessage"
         self._chat_id = chat_id
         self.http = http
+
+    async def call(self, method: str, **payload) -> dict:
+        """One Bot API call, no retries. Returns the parsed reply ({ok, ...})."""
+        payload.setdefault("chat_id", self._chat_id)
+        try:
+            r = await self.http.post(f"{self._base}/{method}", json=payload)
+            return r.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return {"ok": False, "description": f"transport: {exc}"}
 
     async def send(self, text: str, buttons: list[list[dict]] | None = None) -> bool:
         """Send a message. `buttons` is an inline keyboard of {text, url} rows."""
