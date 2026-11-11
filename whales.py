@@ -4,7 +4,9 @@ Listens on the Hyperliquid websocket rather than polling, so it costs no
 request weight and sees a sell within a second of it filling. Two feeds per
 wallet:
 
-  * userFills -- sells on the KNTQ/USDC spot book (@334). One market order
+  * userFills -- sells on the KNTQ/USDC spot book (@334). By default only
+    taker fills count (`crossed`): a market or marketable sell that hits
+    bids, not a resting limit order someone else bought into. One market order
     lands as many fills and a TWAP as many orders, so sells are summed per
     wallet until the wallet goes quiet for SETTLE_S seconds (or MAX_WINDOW_S
     passes), and the total is compared with the threshold.
@@ -47,7 +49,7 @@ DEFAULT_WALLETS = {
     "0xe867fbdad3291530e41530301ecb77693850c78e": "2M HYPE-трейдер",
     "0x549e6dd8453ed87fccdcf4f8b37162b10edc0533": "2.1M генезис",
 }
-DEFAULT_MIN_USD = 10_000.0
+DEFAULT_MIN_USD = 5_000.0
 
 
 def _short(addr: str) -> str:
@@ -73,7 +75,10 @@ class WhaleWatch:
         rec = self.store.get("whales")
         if "wallets" not in rec:
             self.store.update("whales", wallets=dict(DEFAULT_WALLETS),
-                              min_usd=DEFAULT_MIN_USD, on=True)
+                              min_usd=DEFAULT_MIN_USD, on=True, taker_only=True)
+        elif "taker_only" not in rec:
+            # v1.4.0 counted every sell from $10k; now market sells from $5k.
+            self.store.update("whales", min_usd=DEFAULT_MIN_USD, taker_only=True)
         return rec
 
     @property
@@ -83,6 +88,12 @@ class WhaleWatch:
     @property
     def min_usd(self) -> float:
         return float(self.cfg.get("min_usd") or DEFAULT_MIN_USD)
+
+    @property
+    def taker_only(self) -> bool:
+        """Count only sells that hit the book (market / marketable), not a
+        resting limit order being filled by someone else's buy."""
+        return bool(self.cfg.get("taker_only", True))
 
     @property
     def on(self) -> bool:
@@ -176,8 +187,18 @@ class WhaleWatch:
                 continue
             self._seen.add(key)
             sz, px = float(f["sz"]), float(f["px"])
+            taker = bool(f.get("crossed"))
+            if self.taker_only and not taker:
+                log.info("whale %s limit sell filled %.0f KNTQ @ %.5f (ignored)",
+                         self.name(user), sz, px)
+                continue
             b = self._buf.setdefault(user, {"usd": 0.0, "kntq": 0.0, "first": time.time(),
-                                            "lo": px, "hi": px, "n": 0})
+                                            "lo": px, "hi": px, "n": 0, "maker_usd": 0.0,
+                                            "twap": False})
+            if not taker:
+                b["maker_usd"] += sz * px
+            if f.get("twapId") is not None:
+                b["twap"] = True
             b["usd"] += sz * px
             b["kntq"] += sz
             b["lo"], b["hi"] = min(b["lo"], px), max(b["hi"], px)
@@ -214,7 +235,12 @@ class WhaleWatch:
                 self._buf.pop(user, None)
                 if self.on and b["usd"] >= self.min_usd:
                     px = b["usd"] / b["kntq"]
-                    title = f"🐋 {self.name(user)} ПРОДАЄ KNTQ ${b['usd']:,.0f}"
+                    how = "TWAP" if b["twap"] else "маркетом"
+                    if b["maker_usd"] >= b["usd"] - 1:
+                        how = "лімітками"
+                    elif b["maker_usd"]:
+                        how += f" (+${b['maker_usd']:,.0f} лімітками)"
+                    title = f"🐋 {self.name(user)} ПРОДАЄ {how} ${b['usd']:,.0f}"
                     body = (f"{b['kntq']:,.0f} KNTQ на Hyperliquid spot, середня {px:.5f} "
                             f"({b['lo']:.5f}–{b['hi']:.5f}), {b['n']} філів.")
                     await self._alert(user, title, body)
@@ -298,20 +324,26 @@ class WhaleWatch:
             self.store.update("whales", min_usd=value)
             await self.tg.send(f"Поріг продажу: <b>${value:,.0f}</b>")
             return True
+        if sub in ("limits", "limit") and len(parts) >= 2 and parts[1].lower() in ("on", "off"):
+            self.store.update("whales", taker_only=(parts[1].lower() == "off"))
+            await self.tg.send("Лімітні продажі " + ("теж рахую" if parts[1].lower() == "on"
+                                                      else "ігнорую — тільки маркет"))
+            return True
         if sub in ("on", "off"):
             self.store.update("whales", on=(sub == "on"))
             await self.tg.send("🐋 Трекер китів " + ("увімкнено" if sub == "on" else "вимкнено"))
             return True
         if sub == "test":
             await self._alert(next(iter(self.wallets), "0x" + "0" * 40),
-                              "🐋 ТЕСТ: кит продає KNTQ $12,345",
+                              "🐋 ТЕСТ: кит ПРОДАЄ маркетом $12,345",
                               "Так виглядатиме алерт про продаж.")
             return False
         await self.tg.send(
             "<b>/whales</b> — список і баланси\n"
             "<code>/whales add 0x… назва</code> — додати\n"
             "<code>/whales del 0x…</code> — прибрати\n"
-            "<code>/whales min 10000</code> — поріг, $\n"
+            "<code>/whales min 5000</code> — поріг, $\n"
+            "<code>/whales limits on|off</code> — рахувати лімітні продажі\n"
             "<code>/whales on|off</code> · <code>/whales test</code>")
         return False
 
@@ -331,5 +363,6 @@ class WhaleWatch:
         state = "🟢 онлайн" if self.connected else "🔴 перепідключення"
         await self.tg.send(
             f"🐋 <b>Кити KNTQ</b> · {state} · {'увімк' if self.on else 'вимк'}\n"
-            f"Алерт: продаж або вивід від <b>${self.min_usd:,.0f}</b> · KNTQ {mark:.5f}\n\n"
+            f"Алерт: {'маркет-продаж' if self.taker_only else 'будь-який продаж'} або вивід "
+            f"від <b>${self.min_usd:,.0f}</b> · KNTQ {mark:.5f}\n\n"
             + ("\n".join(lines) or "Список порожній."))

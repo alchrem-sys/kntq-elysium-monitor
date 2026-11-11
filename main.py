@@ -59,7 +59,7 @@ from routing import exit_order, remember
 from state import Store
 from whales import WhaleWatch
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -514,7 +514,7 @@ async def run() -> int:
             f"<code>/pulls</code> — де зараз можна вийти, з глибиною\n"
             f"<code>/test</code> — повний розрахунок, англійською\n"
             f"<code>/status</code> — поточний стан\n"
-            f"<code>/whales</code> — кити KNTQ: пуш, коли продають від "
+            f"<code>/whales</code> — кити KNTQ: пуш, коли продають маркетом від "
             f"${whales.min_usd:,.0f}",
             alert_buttons(None, cfg.notional_usd),
         )
