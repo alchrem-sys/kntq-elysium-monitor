@@ -35,6 +35,12 @@ KNTQ_PAIR = "@334"
 SYSTEM_PREFIX = "0x2000000000000000000000000000000000"  # HyperCore -> HyperEVM
 SETTLE_S = 12.0
 MAX_WINDOW_S = 90.0
+# Anti-spam: everything a wallet sells (or moves out) is one "session" until
+# it has been quiet for SESSION_S. The first push goes out as soon as the
+# session total crosses the threshold; after that at most one follow-up per
+# REPEAT_S, and only once another threshold's worth has been added.
+SESSION_S = 600.0
+REPEAT_S = 300.0
 MAX_WALLETS = 10
 EXPLORER = "https://hypurrscan.io/address/"
 
@@ -63,6 +69,7 @@ class WhaleWatch:
         self.pushover = pushover
         self.http = http
         self._buf: dict[str, dict] = {}      # wallet -> pending sell aggregate
+        self._sess: dict[tuple, dict] = {}   # (wallet, "sell"|"move") -> session
         self._seen: set[str] = set()         # fill/ledger ids already counted
         self._resubscribe = asyncio.Event()
         self.connected = False
@@ -217,13 +224,10 @@ class WhaleWatch:
             return  # only KNTQ leaving the wallet
         amount = float(d.get("amount") or 0)
         usd = float(d.get("usdcValue") or 0) or amount * await self._mark()
-        if not self.on or usd < self.min_usd:
-            return
         dest = (d.get("destination") or "").lower()
-        where = "на HyperEVM (міст)" if dest.startswith(SYSTEM_PREFIX) else f"на {_short(dest)}"
-        title = f"🐋 {self.name(user)}: вивів KNTQ ${usd:,.0f}"
-        body = (f"{amount:,.0f} KNTQ {where}. Часто так готують продаж на DEX / Elysium.")
-        await self._alert(user, title, body)
+        where = "HyperEVM (міст)" if dest.startswith(SYSTEM_PREFIX) else _short(dest)
+        log.info("whale %s moved out %.0f KNTQ ($%.0f) to %s", self.name(user), amount, usd, where)
+        await self._add(user, "move", usd, amount, where=where)
 
     async def _flush_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -233,19 +237,86 @@ class WhaleWatch:
                 if now - b["last"] < SETTLE_S and now - b["first"] < MAX_WINDOW_S:
                     continue
                 self._buf.pop(user, None)
-                if self.on and b["usd"] >= self.min_usd:
-                    px = b["usd"] / b["kntq"]
-                    how = "TWAP" if b["twap"] else "маркетом"
-                    if b["maker_usd"] >= b["usd"] - 1:
-                        how = "лімітками"
-                    elif b["maker_usd"]:
-                        how += f" (+${b['maker_usd']:,.0f} лімітками)"
-                    title = f"🐋 {self.name(user)} ПРОДАЄ {how} ${b['usd']:,.0f}"
-                    body = (f"{b['kntq']:,.0f} KNTQ на Hyperliquid spot, середня {px:.5f} "
-                            f"({b['lo']:.5f}–{b['hi']:.5f}), {b['n']} філів.")
-                    await self._alert(user, title, body)
+                how = "TWAP" if b["twap"] else "маркетом"
+                if b["maker_usd"] >= b["usd"] - 1:
+                    how = "лімітками"
+                await self._add(user, "sell", b["usd"], b["kntq"], how=how,
+                                lo=b["lo"], hi=b["hi"], n=b["n"])
+            for key, ss in list(self._sess.items()):
+                if now - ss["last"] >= SESSION_S:
+                    self._sess.pop(key, None)
+                    await self._check(key, ss, closing=True)
+                else:
+                    await self._check(key, ss)
             if len(self._seen) > 50_000:
                 self._seen = set(list(self._seen)[-20_000:])
+
+    async def _add(self, user: str, kind: str, usd: float, kntq: float, **info) -> None:
+        now = time.time()
+        key = (user, kind)
+        ss = self._sess.get(key)
+        if ss is not None and now - ss["last"] >= SESSION_S:
+            self._sess.pop(key, None)
+            await self._check(key, ss, closing=True)
+            ss = None
+        if ss is None:
+            ss = self._sess[key] = {"start": now, "usd": 0.0, "kntq": 0.0, "rep_usd": 0.0,
+                                    "rep_kntq": 0.0, "last_alert": 0.0, "lo": None, "hi": None,
+                                    "how": set(), "where": set(), "n": 0}
+        ss["last"] = now
+        ss["usd"] += usd
+        ss["kntq"] += kntq
+        ss["n"] += info.get("n", 1)
+        if info.get("how"):
+            ss["how"].add(info["how"])
+        if info.get("where"):
+            ss["where"].add(info["where"])
+        if info.get("lo") is not None:
+            ss["lo"] = info["lo"] if ss["lo"] is None else min(ss["lo"], info["lo"])
+            ss["hi"] = info["hi"] if ss["hi"] is None else max(ss["hi"], info["hi"])
+        await self._check(key, ss)
+
+    async def _check(self, key: tuple, ss: dict, closing: bool = False) -> None:
+        """Push if this session owes one: first crossing, or a follow-up."""
+        if not self.on:
+            return
+        user, kind = key
+        now = time.time()
+        new_usd = ss["usd"] - ss["rep_usd"]
+        if ss["rep_usd"] == 0:
+            due = ss["usd"] >= self.min_usd
+        else:
+            due = new_usd >= self.min_usd and (closing or now - ss["last_alert"] >= REPEAT_S)
+        if not due:
+            return
+        first = ss["rep_usd"] == 0
+        new_kntq = ss["kntq"] - ss["rep_kntq"]
+        ss.update(rep_usd=ss["usd"], rep_kntq=ss["kntq"], last_alert=now)
+        mins = max(1, round((now - ss["start"]) / 60))
+        name = self.name(user)
+        if kind == "sell":
+            how = "/".join(sorted(ss["how"])) or "маркетом"
+            px = ss["usd"] / ss["kntq"] if ss["kntq"] else 0
+            rng = f" ({ss['lo']:.5f}–{ss['hi']:.5f})" if ss["lo"] is not None else ""
+            if first:
+                title = f"🐋 {name} ПРОДАЄ {how} ${ss['usd']:,.0f}"
+                body = f"{ss['kntq']:,.0f} KNTQ на Hyperliquid spot, середня {px:.5f}{rng}."
+            else:
+                title = f"🐋 {name} продовжує продавати: +${new_usd:,.0f}"
+                body = (f"+{new_kntq:,.0f} KNTQ. Всього ${ss['usd']:,.0f} "
+                        f"({ss['kntq']:,.0f} KNTQ) за {mins} хв, середня {px:.5f}{rng}.")
+        else:
+            where = ", ".join(sorted(ss["where"])) or "?"
+            if first:
+                title = f"🐋 {name}: вивів KNTQ ${ss['usd']:,.0f}"
+                body = (f"{ss['kntq']:,.0f} KNTQ → {where}. "
+                        f"Часто так готують продаж на DEX / Elysium.")
+            else:
+                title = f"🐋 {name} виводить далі: +${new_usd:,.0f}"
+                body = f"Всього ${ss['usd']:,.0f} ({ss['kntq']:,.0f} KNTQ) за {mins} хв → {where}."
+        if not closing:
+            body += f"\nНаступний пуш по ньому — не раніше ніж за {REPEAT_S / 60:.0f} хв."
+        await self._alert(user, title, body)
 
     async def _alert(self, user: str, title: str, body: str) -> None:
         log.info("WHALE ALERT %s | %s", title, body)

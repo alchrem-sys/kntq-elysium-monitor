@@ -60,7 +60,7 @@ from state import Store
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 logging.basicConfig(
     level=logging.INFO,
