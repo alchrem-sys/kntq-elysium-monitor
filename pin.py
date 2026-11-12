@@ -100,7 +100,10 @@ class SpreadPin:
         body = text.split("\n<i>", 1)[0]   # ignore the clock when comparing
         if body == self._last_text.split("\n<i>", 1)[0] and now - self._last_edit < FORCE_EDIT_S:
             return
-        await self._publish(text)
+        try:
+            await self._publish(text)
+        except RuntimeError:
+            return
         self._last_text, self._last_edit = text, now
 
     async def _render(self) -> str:
@@ -141,15 +144,21 @@ class SpreadPin:
             r = await self.tg.call("editMessageText", message_id=mid, text=text,
                                    parse_mode="HTML", disable_web_page_preview=True,
                                    reply_markup=self._buttons())
-            if r.get("ok") or "not modified" in (r.get("description") or ""):
+            desc = r.get("description") or ""
+            if r.get("ok") or "not modified" in desc:
                 return
-            log.warning("pin edit failed (%s); posting a new one", r.get("description"))
+            if "not found" not in desc and "can't be edited" not in desc:
+                # Telegram hiccup (502, timeout): keep the pin, try next round.
+                log.warning("pin edit failed (%s); will retry", desc)
+                self._last_text = ""
+                raise RuntimeError(desc)
+            log.warning("pin message gone (%s); posting a new one", desc)
         r = await self.tg.call("sendMessage", text=text, parse_mode="HTML",
                                disable_web_page_preview=True, disable_notification=True,
                                reply_markup=self._buttons())
         if not r.get("ok"):
             log.warning("pin send failed: %s", r.get("description"))
-            return
+            raise RuntimeError(r.get("description") or "send failed")
         mid = r["result"]["message_id"]
         p = await self.tg.call("pinChatMessage", message_id=mid, disable_notification=True)
         if not p.get("ok"):
