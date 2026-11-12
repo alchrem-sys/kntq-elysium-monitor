@@ -29,6 +29,7 @@ DEFAULT_SIZE = 5000.0
 MIN_EDIT_S = 10.0
 FORCE_EDIT_S = 60.0      # refresh the clock even if the numbers did not move
 FOMO_PCT = 0.05          # exit cost through fomo, measured ~0.04%
+KYBER_SWAP_URL = "https://kyberswap.com/swap/elysium/kntq-to-usdc"
 STALE_S = 45.0           # older than this, the numbers get an age label
 try:
     from zoneinfo import ZoneInfo
@@ -136,7 +137,8 @@ class SpreadPin:
 
     def _buttons(self):
         return {"inline_keyboard": [[{"text": "Hype Spot", "url": HYPE_SPOT_URL},
-                                     {"text": "Bridge", "url": BRIDGE_URL}]]}
+                                     {"text": "Bridge", "url": BRIDGE_URL}],
+                                    [{"text": "Kyber", "url": KYBER_SWAP_URL}]]}
 
     async def _publish(self, text: str) -> None:
         mid = self.rec.get("message_id")
