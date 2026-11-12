@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -37,6 +38,11 @@ log = logging.getLogger("markets")
 
 KYBER_BASE = "https://aggregator-api.kyberswap.com/elysium/api/v1"
 KYBER_HEADERS = {"x-client-id": "kntq-elysium-monitor"}
+# Every Kyber call in the service goes through one gate: at most one request
+# per KYBER_MIN_GAP_S, and after a 429 nobody calls Kyber until the cooldown
+# ends (retrying into a 429 only extends the ban).
+KYBER_MIN_GAP_S = 1.2
+KYBER_COOLDOWN_S = (5.0, 60.0)
 RELAY_QUOTE = "https://api.relay.link/quote"
 
 # carrier -> (kyber sell-to token, lifi/relay origin token, decimals)
@@ -85,6 +91,32 @@ class Markets:
         self.http = http
         self.lifi_requests = 0
         self.other_requests = 0
+        self._kyber_lock = asyncio.Lock()
+        self._kyber_next = 0.0
+        self._kyber_cool_until = 0.0
+        self._kyber_cooldown = KYBER_COOLDOWN_S[0]
+        self.kyber_429 = 0
+
+    async def _kyber_get(self, params: dict) -> httpx.Response | None:
+        """Rate-gated Kyber GET. None while cooling down after a 429."""
+        async with self._kyber_lock:
+            now = time.monotonic()
+            if now < self._kyber_cool_until:
+                return None
+            if now < self._kyber_next:
+                await asyncio.sleep(self._kyber_next - now)
+            self._kyber_next = time.monotonic() + KYBER_MIN_GAP_S
+            self.other_requests += 1
+            r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
+            if r.status_code == 429:
+                self.kyber_429 += 1
+                self._kyber_cool_until = time.monotonic() + self._kyber_cooldown
+                log.warning("Kyber 429: cooling down %.0fs", self._kyber_cooldown)
+                self._kyber_cooldown = min(self._kyber_cooldown * 2, KYBER_COOLDOWN_S[1])
+                return None
+            if r.is_success:
+                self._kyber_cooldown = KYBER_COOLDOWN_S[0]
+            return r
 
     # ---------- Elysium sell side ----------
 
@@ -95,8 +127,9 @@ class Markets:
                   "amountIn": raw_amount, "gasInclude": "true"}
         for attempt in range(3):
             try:
-                self.other_requests += 1
-                r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
+                r = await self._kyber_get(params)
+                if r is None:
+                    return None  # cooling down after a 429
                 if r.is_success:
                     s = (r.json().get("data") or {}).get("routeSummary") or {}
                     if not s.get("amountOut"):
@@ -119,8 +152,9 @@ class Markets:
         }
         for attempt in range(3):
             try:
-                self.other_requests += 1
-                r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
+                r = await self._kyber_get(params)
+                if r is None:
+                    return None  # cooling down after a 429
                 if r.is_success:
                     summary = (r.json().get("data") or {}).get("routeSummary") or {}
                     if not summary.get("amountOut"):

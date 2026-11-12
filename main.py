@@ -60,7 +60,7 @@ from state import Store
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,7 +204,7 @@ def tell_message(chain: str, carrier: str, provider: str, loss: float,
 
 
 async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
-                     fill, sell_used: float) -> None:
+                     fill, sell_used: float, size: float) -> None:
     """/only: spread watch. Fires on crossing the threshold, and again each
     time the spread climbs ESCALATION_PCT above where it last fired, so a
     move from 2% to 5% doesn't pass in silence. Needs no exit at all."""
@@ -220,16 +220,16 @@ async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
     if due:
         store.update("only", fired=True, fired_at=round(spread, 3))
         await push(f"KNTQ спред {_pct(spread)}",
-                   f"Поріг {only_pct:.2f}%. ${cfg.notional_usd:,.0f} → "
+                   f"Поріг {only_pct:.2f}%. ${size:,.0f} → "
                    f"{sell_used:,.2f} USDC на Elysium "
-                   f"({cfg.notional_usd * spread / 100:+,.0f}$ валом).",
+                   f"({size * spread / 100:+,.0f}$ валом).",
                    url=HYPE_SPOT_URL, url_title="Hype Spot")
         await tg.send(
             f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
             f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
-            f"${cfg.notional_usd:,.0f} → {fill.qty:,.0f} KNTQ → "
+            f"${size:,.0f} → {fill.qty:,.0f} KNTQ → "
             f"<b>{sell_used:,.2f} USDC</b> на Elysium\n"
-            f"Валом {cfg.notional_usd * spread / 100:+,.0f}$ до вартості виходу.",
+            f"Валом {size * spread / 100:+,.0f}$ до вартості виходу.",
             alert_buttons(None, sell_used),
         )
         log.info("ONLY alert sent at %+.2f%%", spread)
@@ -239,7 +239,7 @@ async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
 
 
 async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
-                      store: Store, tg: Telegram) -> None:
+                      store: Store, tg: Telegram, pin=None) -> None:
     """Fast loop: spread only, every few seconds.
 
     Two requests a round -- the HyperCore book and one Kyber quote -- and no
@@ -254,7 +254,10 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
     while not _stop.is_set():
         interval = rt.spread_poll_seconds
         try:
-            fill = await core.buy_fill(cfg.notional_usd, cfg.taker_fee_pct)
+            # One quote feeds /only and the pinned message: the lap size is
+            # the pin's when the pin is on, so the pin costs no extra requests.
+            size = pin.size if pin is not None and pin.on else cfg.notional_usd
+            fill = await core.buy_fill(size, cfg.taker_fee_pct)
             q = None
             if fill is not None and fill.filled:
                 q = await markets.quote_elysium(KNTQ_ELYSIUM, USDC_ELYSIUM,
@@ -267,9 +270,12 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
                 spread = 100.0 * (sell_used / fill.cost_usd - 1.0)
                 now = time.time()
                 _snapshot.update({"spread": spread, "spread_ts": now,
-                                  "buy_px": fill.avg_px, "depth": fill.book_depth_usd})
+                                  "buy_px": fill.avg_px, "depth": fill.book_depth_usd,
+                                  "size": size, "sell_used": sell_used, "qty": fill.qty})
+                if pin is not None:
+                    pin.kick()
                 store.update("spread", last_pct=round(spread, 3))
-                await check_only(cfg, store, tg, spread, fill, sell_used)
+                await check_only(cfg, store, tg, spread, fill, sell_used, size)
                 if (spread >= rt.go_spread_pct - cfg.clear_margin_pct
                         and now - _snapshot.get("tick_ts", 0) > 20):
                     _wake.set()
@@ -498,7 +504,7 @@ async def run() -> int:
         global _push
         _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
         whales = WhaleWatch(store, tg, _push, http)
-        pin = SpreadPin(cfg, store, tg, core, markets, rt)
+        pin = SpreadPin(cfg, store, tg, rt, snapshot)
         commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push, whales, pin)
 
         await tg.send(
@@ -525,7 +531,7 @@ async def run() -> int:
 
         tasks = [
             asyncio.create_task(monitor_loop(cfg, rt, core, markets, store, tg)),
-            asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg)),
+            asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg, pin)),
             asyncio.create_task(commands.run(_stop)),
             asyncio.create_task(whales.run(_stop)),
             asyncio.create_task(pin.run(_stop)),

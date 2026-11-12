@@ -2,8 +2,12 @@
 
 Shows what a fixed lap (default $5k) makes right now -- buy on the
 HyperCore book with the taker fee, sell on Elysium through KyberSwap -- so
-nobody has to send /status. The message id lives in the settings key, so a
-redeploy keeps editing the same pin instead of posting a new one.
+nobody has to send /status. It makes no requests of its own: the fast
+spread loop quotes at the pin's size and kicks the pin with each result, so
+a pinned message adds nothing to the Kyber rate limit. When a quote is
+missing (Kyber cooling down), the last good numbers stay up with their age.
+The message id lives in the settings key, so a redeploy keeps editing the
+same pin instead of posting a new one.
 
 Telegram allows roughly one edit per second per chat; this edits at most
 every MIN_EDIT_S and only when the text actually changes.
@@ -16,7 +20,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from config import BRIDGE_URL, HYPE_SPOT_URL, KNTQ_ELYSIUM, USDC_ELYSIUM
+from config import BRIDGE_URL, HYPE_SPOT_URL
 
 log = logging.getLogger("pin")
 
@@ -25,6 +29,7 @@ DEFAULT_SIZE = 5000.0
 MIN_EDIT_S = 10.0
 FORCE_EDIT_S = 60.0      # refresh the clock even if the numbers did not move
 FOMO_PCT = 0.05          # exit cost through fomo, measured ~0.04%
+STALE_S = 45.0           # older than this, the numbers get an age label
 try:
     from zoneinfo import ZoneInfo
     WARSAW = ZoneInfo("Europe/Warsaw")
@@ -37,13 +42,12 @@ def _now_local() -> str:
 
 
 class SpreadPin:
-    def __init__(self, cfg, store, tg, core, markets, runtime):
+    def __init__(self, cfg, store, tg, runtime, snapshot):
         self.cfg = cfg
         self.store = store
         self.tg = tg
-        self.core = core
-        self.markets = markets
         self.runtime = runtime
+        self.snapshot = snapshot      # callable -> fast-loop data
         self._last_text = ""
         self._last_edit = 0.0
         self._kick = asyncio.Event()
@@ -61,6 +65,9 @@ class SpreadPin:
     @property
     def size(self) -> float:
         return float(self.rec.get("size") or DEFAULT_SIZE)
+
+    def kick(self) -> None:
+        self._kick.set()
 
     # ---------- loop ----------
 
@@ -86,8 +93,10 @@ class SpreadPin:
             t.cancel()
 
     async def _round(self) -> None:
-        text = await self._render()
         now = time.monotonic()
+        if now - self._last_edit < MIN_EDIT_S - 0.5:
+            return  # Telegram caps edits per chat; the next kick catches up
+        text = await self._render()
         body = text.split("\n<i>", 1)[0]   # ignore the clock when comparing
         if body == self._last_text.split("\n<i>", 1)[0] and now - self._last_edit < FORCE_EDIT_S:
             return
@@ -96,36 +105,30 @@ class SpreadPin:
 
     async def _render(self) -> str:
         size = self.size
-        fill = await self.core.buy_fill(size, self.cfg.taker_fee_pct)
-        if fill is None or not fill.filled:
+        snap = self.snapshot() or {}
+        ts = snap.get("spread_ts")
+        if ts is None or abs((snap.get("size") or 0) - size) > 0.5:
             return (f"📌 <b>KNTQ спред · ${size:,.0f}</b>\n"
-                    f"Книга Hyperliquid не тягне ${size:,.0f}.\n<i>оновлено {_now_local()}</i>")
-        q = await self.markets.quote_elysium(KNTQ_ELYSIUM, USDC_ELYSIUM,
-                                             str(int(fill.qty * 1e18)))
-        if q is None:
-            return (f"📌 <b>KNTQ спред · ${size:,.0f}</b>\n"
-                    f"Немає котирування на Elysium.\n<i>оновлено {_now_local()}</i>")
-        sell = q[0] / 1e6
-        spread = 100.0 * (sell / fill.cost_usd - 1.0)
-        # cost_usd already carries the taker fee, so the spread is fee-inclusive.
+                    f"⏳ рахую перше котирування…\n<i>{_now_local()}</i>")
+        spread = snap["spread"]
+        sell = snap["sell_used"]
         net_usd = size * (1 + spread / 100) * (1 - FOMO_PCT / 100) - size
         net_pct = 100.0 * net_usd / size
         go = self.runtime.go_spread_pct
-        if spread >= go:
-            mark = "🟢"
-        elif spread > 0:
-            mark = "🟡"
-        else:
-            mark = "🔴"
+        mark = "🟢" if spread >= go else ("🟡" if spread > 0 else "🔴")
         lines = [
             f"📌 <b>KNTQ спред · ${size:,.0f}</b>",
             f"{mark} <b>{spread:+.2f}%</b>  →  чистими <b>{net_usd:+,.0f}$</b> ({net_pct:+.2f}%)",
-            f"Купівля HL: {fill.avg_px:.5f} (з комісією)",
-            f"Продаж Elysium: {sell / fill.qty:.5f} → {sell:,.2f} USDC",
+            f"Купівля HL: {snap['buy_px']:.5f} (з комісією)",
+            f"Продаж Elysium: {sell / snap['qty']:.5f} → {sell:,.2f} USDC",
         ]
         if spread < 0:
             lines.append(f"↩️ Elysium дешевший на {-spread:.2f}% — зворотний бік")
-        lines.append(f"<i>оновлено {_now_local()} · поріг {go:.2f}%</i>")
+        age = time.time() - ts
+        stamp = datetime.fromtimestamp(ts, WARSAW).strftime("%H:%M:%S")
+        if age > STALE_S:
+            lines.append(f"⏳ котирування {age:.0f}с тому — Kyber пригальмовує, тримаю останнє")
+        lines.append(f"<i>котирування {stamp} · поріг {go:.2f}%</i>")
         return "\n".join(lines)
 
     def _buttons(self):
