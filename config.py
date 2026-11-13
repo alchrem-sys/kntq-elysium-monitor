@@ -175,6 +175,7 @@ def _chains(name: str, default: list[int]) -> list[int]:
 class Config:
     telegram_token: str
     telegram_chat_id: str
+    telegram_thread_id: int | None
     telegram_admin_ids: frozenset[str]
     pushover_app_token: str
     pushover_priority: int
@@ -220,6 +221,8 @@ def load() -> Config:
     return Config(
         telegram_token=_req("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_req("TELEGRAM_CHAT_ID"),
+        telegram_thread_id=int(os.environ["TELEGRAM_THREAD_ID"])
+        if os.environ.get("TELEGRAM_THREAD_ID", "").strip() else None,
         telegram_admin_ids=frozenset(
             x.strip() for x in os.getenv("TELEGRAM_ADMIN_ID", "").split(",") if x.strip()
         ),

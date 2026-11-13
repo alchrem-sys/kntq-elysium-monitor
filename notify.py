@@ -11,15 +11,19 @@ log = logging.getLogger("notify")
 
 
 class Telegram:
-    def __init__(self, token: str, chat_id: str, http: httpx.AsyncClient):
+    def __init__(self, token: str, chat_id: str, http: httpx.AsyncClient,
+                 thread_id: int | None = None):
         self._base = f"https://api.telegram.org/bot{token}"
         self._url = f"{self._base}/sendMessage"
         self._chat_id = chat_id
+        self._thread_id = thread_id   # forum topic in a supergroup, if any
         self.http = http
 
     async def call(self, method: str, **payload) -> dict:
         """One Bot API call, no retries. Returns the parsed reply ({ok, ...})."""
         payload.setdefault("chat_id", self._chat_id)
+        if method == "sendMessage" and self._thread_id:
+            payload.setdefault("message_thread_id", self._thread_id)
         try:
             r = await self.http.post(f"{self._base}/{method}", json=payload)
             return r.json()
@@ -34,6 +38,8 @@ class Telegram:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if self._thread_id:
+            payload["message_thread_id"] = self._thread_id
         if buttons:
             payload["reply_markup"] = {"inline_keyboard": buttons}
         for attempt in range(3):

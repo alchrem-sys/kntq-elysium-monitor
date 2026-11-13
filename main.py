@@ -60,7 +60,7 @@ from state import Store
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -499,7 +499,7 @@ async def run() -> int:
 
         core = HyperCore(HYPERCORE_KNTQ_USDC, http)
         markets = Markets(cfg, http)
-        tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http)
+        tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http, cfg.telegram_thread_id)
         rt = Runtime(cfg, store)
         global _push
         _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
