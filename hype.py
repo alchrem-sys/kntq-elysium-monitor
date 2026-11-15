@@ -13,7 +13,8 @@ import logging
 import re
 import time
 
-from config import BRIDGE_URL, HYPE_USDC_SPOT_URL, KYBER_HYPE_URL, KYBER_NATIVE, USDC_ELYSIUM
+from config import (BRIDGE_URL, HYPE_USDC_SPOT_URL, KYBER_HYPE_URL, KYBER_NATIVE, PUSH_QUIET_S,
+                    USDC_ELYSIUM)
 
 log = logging.getLogger("hype")
 
@@ -69,8 +70,11 @@ class HypeScan:
         if not pct:
             return
         spread, fired_at, size = s["pct"], self.rec.get("at"), s["size"]
-        if spread >= pct and (fired_at is None or spread >= fired_at + ESCALATION_PCT):
-            self.store.update("hype", at=round(spread, 3))
+        due = spread >= pct and (fired_at is None or spread >= fired_at + ESCALATION_PCT)
+        if due and time.time() - (self.rec.get("pushed_ts") or 0) < PUSH_QUIET_S:
+            return      # one alert an hour; if it is still above when the hour ends, it fires then
+        if due:
+            self.store.update("hype", at=round(spread, 3), pushed_ts=time.time())
             gain = size * spread / 100
             await self.push(f"HYPE спред {spread:+.2f}%",
                             f"Поріг {pct:.2f}%. ${size:,.0f} → {s['out']:,.2f} USDC на Elysium "
@@ -116,6 +120,7 @@ class HypeScan:
         if not 0.1 <= pct <= 50:
             await self.tg.send("Поріг має бути між 0.1% і 50%.")
             return False
-        self.store.update("hype", pct=pct, off=False, at=None)
-        await self.tg.send(f"👁 HYPE: пуш у Pushover, коли спред HL → Elysium вище <b>{pct:.2f}%</b>.")
+        self.store.update("hype", pct=pct, off=False, at=None, pushed_ts=None)
+        await self.tg.send(f"👁 HYPE: пуш у Pushover, коли спред HL → Elysium вище <b>{pct:.2f}%</b>. "
+                           f"Після алерта годину мовчу.")
         return True

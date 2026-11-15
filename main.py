@@ -47,6 +47,7 @@ from config import (
     HYPE_SPOT_URL,
     Config,
     HYPERCORE_HYPE_USDC,
+    PUSH_QUIET_S,
     HYPERCORE_KNTQ_USDC,
     KNTQ_ELYSIUM,
     KYBER_NATIVE,
@@ -62,7 +63,7 @@ from hype import HYPE_EVERY, HypeScan
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,8 +220,10 @@ async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
         not only.get("fired") or
         (fired_at is not None and spread >= fired_at + ESCALATION_PCT)
     )
+    if due and time.time() - (only.get("pushed_ts") or 0) < PUSH_QUIET_S:
+        return      # one alert an hour; if it is still above when the hour ends, it fires then
     if due:
-        store.update("only", fired=True, fired_at=round(spread, 3))
+        store.update("only", fired=True, fired_at=round(spread, 3), pushed_ts=time.time())
         await push(f"KNTQ спред {_pct(spread)}",
                    f"Поріг {only_pct:.2f}%. ${size:,.0f} → "
                    f"{sell_used:,.2f} USDC на Elysium "

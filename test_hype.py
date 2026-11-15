@@ -87,13 +87,23 @@ async def main():
     assert len(pushes) == 1 and "HYPE спред +1.13%" in pushes[0] and "USDC</b> на Elysium" in tg.sent[-1]
     await h.round(5000.0)
     assert len(pushes) == 1
+
+    def hour_later():
+        store.get("hype")["pushed_ts"] -= 3601
+    # within the hour nothing more goes out: not on a climb, not on a fresh crossing
     mk.sell_usdc = 5090.0                                   # +1.73%
     await h.round(5000.0)
-    assert len(pushes) == 2
     mk.sell_usdc = 5020.0                                   # +0.33% < 1 - 0.4: re-arm
     await h.round(5000.0)
     assert store.get("hype")["at"] is None
-    mk.sell_usdc = 5060.0
+    mk.sell_usdc = 5060.0                                   # crosses again, still inside the hour
+    await h.round(5000.0)
+    assert len(pushes) == 1 and len(tg.sent) == 1
+    hour_later()                                            # still above when the hour ends: fires now
+    await h.round(5000.0)
+    assert len(pushes) == 2
+    hour_later()
+    mk.sell_usdc = 5090.0                                   # +0.5% more, an hour later: escalation
     await h.round(5000.0)
     assert len(pushes) == 3
 

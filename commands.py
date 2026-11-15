@@ -364,12 +364,11 @@ class CommandServer:
         if not 0.1 <= pct <= 50:
             await self.tg.send("Поріг має бути між 0.1% і 50%.")
             return
-        self.store.update("only", pct=pct, fired=False)
+        self.store.update("only", pct=pct, fired=False, pushed_ts=None)
         await self.tg.send(
             f"👁 Стежу за спредом вище <b>{pct:.2f}%</b>.\n"
             f"Коли перевалить — пуш у Pushover і повідомлення з цифрами тут.\n"
-            f"Далі мовчу, поки спред не впаде нижче "
-            f"{max(0.0, pct - self.cfg.clear_margin_pct):.2f}% і не підніметься знову."
+            f"Після алерта годину мовчу, щоб не спамити."
         )
 
     async def _cmd_test(self) -> None:
