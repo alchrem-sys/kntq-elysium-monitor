@@ -63,7 +63,7 @@ from hype import HYPE_EVERY, HypeScan
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,21 +220,23 @@ async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
         not only.get("fired") or
         (fired_at is not None and spread >= fired_at + ESCALATION_PCT)
     )
-    if due and time.time() - (only.get("pushed_ts") or 0) < PUSH_QUIET_S:
-        return      # one alert an hour; if it is still above when the hour ends, it fires then
     if due:
-        store.update("only", fired=True, fired_at=round(spread, 3), pushed_ts=time.time())
-        await push(f"KNTQ спред {_pct(spread)}",
-                   f"Поріг {only_pct:.2f}%. ${size:,.0f} → "
-                   f"{sell_used:,.2f} USDC на Elysium "
-                   f"({size * spread / 100:+,.0f}$ валом).",
-                   url=HYPE_SPOT_URL, url_title="Hype Spot")
+        store.update("only", fired=True, fired_at=round(spread, 3))
+        loud = time.time() - (only.get("pushed_ts") or 0) >= PUSH_QUIET_S
+        if loud:        # one loud push an hour; the message below is sent every time
+            store.update("only", pushed_ts=time.time())
+            await push(f"KNTQ спред {_pct(spread)}",
+                       f"Поріг {only_pct:.2f}%. ${size:,.0f} → "
+                       f"{sell_used:,.2f} USDC на Elysium "
+                       f"({size * spread / 100:+,.0f}$ валом).",
+                       url=HYPE_SPOT_URL, url_title="Hype Spot")
         await tg.send(
             f"📈 <b>Спред {_pct(spread)}</b>  (поріг {only_pct:.2f}%)\n\n"
             f"Купівля {fill.avg_px:.5f} · книга ${fill.book_depth_usd:,.0f}\n"
             f"${size:,.0f} → {fill.qty:,.0f} KNTQ → "
             f"<b>{sell_used:,.2f} USDC</b> на Elysium\n"
-            f"Валом {size * spread / 100:+,.0f}$ до вартості виходу.",
+            f"Валом {size * spread / 100:+,.0f}$ до вартості виходу."
+            + ("" if loud else "\n🔇 без пуша: Pushover мовчить годину після останнього"),
             alert_buttons(None, sell_used),
         )
         log.info("ONLY alert sent at %+.2f%%", spread)

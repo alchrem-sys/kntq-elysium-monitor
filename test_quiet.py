@@ -1,4 +1,4 @@
-"""KNTQ spread alert: one an hour."""
+"""KNTQ spread alert: every step goes to the group, Pushover at most once an hour."""
 import asyncio
 import os
 
@@ -40,15 +40,16 @@ async def go():
     fire = lambda spread: M.check_only(Cfg(), st, tg, spread, fill, 5000 * (1 + spread / 100), 5000.0)  # noqa: E731
     await fire(1.2)
     assert len(pushes) == 1 and Tg.sent == 1
-    await fire(2.5)                      # +1% escalation, but inside the hour
+    await fire(2.5)                      # +1% escalation inside the hour: message, no push
+    assert len(pushes) == 1 and Tg.sent == 2
     await fire(0.3)                      # re-arms
-    await fire(1.4)                      # crosses again, still inside the hour
-    assert len(pushes) == 1 and Tg.sent == 1
+    await fire(1.4)                      # crosses again inside the hour: message, no push
+    assert len(pushes) == 1 and Tg.sent == 3
+    await fire(1.5)                      # nothing new
+    assert Tg.sent == 3
     st.get("only")["pushed_ts"] -= 3601
-    await fire(1.4)                      # hour over and still above: now
-    assert len(pushes) == 2 and Tg.sent == 2
-    await fire(3.0)
-    assert len(pushes) == 2
+    await fire(2.6)                      # next step after the hour: loud again
+    assert len(pushes) == 2 and Tg.sent == 4
     print("quiet ok")
 
 asyncio.run(go())

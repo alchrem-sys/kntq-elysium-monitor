@@ -70,20 +70,22 @@ class HypeScan:
         if not pct:
             return
         spread, fired_at, size = s["pct"], self.rec.get("at"), s["size"]
-        due = spread >= pct and (fired_at is None or spread >= fired_at + ESCALATION_PCT)
-        if due and time.time() - (self.rec.get("pushed_ts") or 0) < PUSH_QUIET_S:
-            return      # one alert an hour; if it is still above when the hour ends, it fires then
-        if due:
-            self.store.update("hype", at=round(spread, 3), pushed_ts=time.time())
+        if spread >= pct and (fired_at is None or spread >= fired_at + ESCALATION_PCT):
+            self.store.update("hype", at=round(spread, 3))
             gain = size * spread / 100
-            await self.push(f"HYPE спред {spread:+.2f}%",
-                            f"Поріг {pct:.2f}%. ${size:,.0f} → {s['out']:,.2f} USDC на Elysium "
-                            f"({gain:+,.0f}$ валом).",
-                            url=HYPE_USDC_SPOT_URL, url_title="HYPE Spot")
+            loud = time.time() - (self.rec.get("pushed_ts") or 0) >= PUSH_QUIET_S
+            if loud:        # one loud push an hour; the message below is sent every time
+                self.store.update("hype", pushed_ts=time.time())
+                await self.push(f"HYPE спред {spread:+.2f}%",
+                                f"Поріг {pct:.2f}%. ${size:,.0f} → {s['out']:,.2f} USDC на Elysium "
+                                f"({gain:+,.0f}$ валом).",
+                                url=HYPE_USDC_SPOT_URL, url_title="HYPE Spot")
             await self.tg.send(f"📈 <b>HYPE спред {spread:+.2f}%</b>  (поріг {pct:.2f}%)\n\n"
                                f"Купівля HL {s['buy_px']:.3f} (з комісією)\n"
                                f"${size:,.0f} → {s['qty']:,.2f} HYPE → <b>{s['out']:,.2f} USDC</b> на Elysium\n"
-                               f"Валом {gain:+,.0f}$", buttons())
+                               f"Валом {gain:+,.0f}$"
+                               + ("" if loud else "\n🔇 без пуша: Pushover мовчить годину після останнього"),
+                               buttons())
             log.info("HYPE alert at %+.2f%%", spread)
         elif fired_at is not None and spread < pct - self.cfg.clear_margin_pct:
             self.store.update("hype", at=None)
@@ -122,5 +124,5 @@ class HypeScan:
             return False
         self.store.update("hype", pct=pct, off=False, at=None, pushed_ts=None)
         await self.tg.send(f"👁 HYPE: пуш у Pushover, коли спред HL → Elysium вище <b>{pct:.2f}%</b>. "
-                           f"Після алерта годину мовчу.")
+                           f"Pushover після пуша мовчить годину, повідомлення тут ідуть далі.")
         return True

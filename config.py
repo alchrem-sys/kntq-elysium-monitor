@@ -31,7 +31,8 @@ HYPERCORE_HYPE_USDC = "@107"
 HYPE_USDC_SPOT_URL = "https://app.hyperliquid.xyz/trade/HYPE/USDC"
 KYBER_HYPE_URL = "https://kyberswap.com/swap/elysium/hype-to-usdc"
 
-# After a spread alert (Pushover + group message) the same asset stays quiet this long.
+# After a Pushover push about a spread, that asset's pushes stay muted this long.
+# The group messages keep coming, so the spread can still be followed.
 PUSH_QUIET_S = 3600.0
 
 # Native HYPE is spelled differently by each API.

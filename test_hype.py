@@ -90,22 +90,20 @@ async def main():
 
     def hour_later():
         store.get("hype")["pushed_ts"] -= 3601
-    # within the hour nothing more goes out: not on a climb, not on a fresh crossing
-    mk.sell_usdc = 5090.0                                   # +1.73%
+    # within the hour the group still gets every step, Pushover stays silent
+    mk.sell_usdc = 5090.0                                   # +1.73%: escalation
     await h.round(5000.0)
+    assert len(pushes) == 1 and len(tg.sent) == 2 and "без пуша" in tg.sent[-1]
     mk.sell_usdc = 5020.0                                   # +0.33% < 1 - 0.4: re-arm
     await h.round(5000.0)
     assert store.get("hype")["at"] is None
     mk.sell_usdc = 5060.0                                   # crosses again, still inside the hour
     await h.round(5000.0)
-    assert len(pushes) == 1 and len(tg.sent) == 1
-    hour_later()                                            # still above when the hour ends: fires now
-    await h.round(5000.0)
-    assert len(pushes) == 2
+    assert len(pushes) == 1 and len(tg.sent) == 3
     hour_later()
-    mk.sell_usdc = 5090.0                                   # +0.5% more, an hour later: escalation
+    mk.sell_usdc = 5090.0                                   # next step after the hour: loud again
     await h.round(5000.0)
-    assert len(pushes) == 3
+    assert len(pushes) == 2 and len(tg.sent) == 4 and "без пуша" not in tg.sent[-1]
 
     # a miss keeps the last reading and never alerts; an old reading gets an age mark
     mk.sell_usdc = None
@@ -120,11 +118,11 @@ async def main():
     # /hype 2 moves the threshold, /hype off silences, /hype shows
     assert await h.command("2") and h.pct == 2.0
     await h.round(5000.0)
-    assert len(pushes) == 3
+    assert len(pushes) == 2
     assert await h.command("off") and h.pct is None
     mk.sell_usdc = 5200.0
     await h.round(5000.0)
-    assert len(pushes) == 3
+    assert len(pushes) == 2
     assert await h.command("1") and h.pct == 1.0
     assert not await h.command(None) and "Алерт: пуш від <b>1.00%</b>" in tg.sent[-1]
     assert HYPE_RE.match("/hype").group(1) is None and HYPE_RE.match("/hype@bot 1.5%").group(1) == "1.5"
