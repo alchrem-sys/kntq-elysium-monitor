@@ -71,6 +71,19 @@ trustworthy — a spot mark would quietly decide the answer.
 
 `/spread` and `/pulls` are limited to `TELEGRAM_ADMIN_ID` when it is set.
 
+## HYPE spread
+
+The fast loop also measures HYPE between HyperCore spot (`@107`) and Elysium,
+for the same lap size as the pin, in both directions:
+
+- **HL → Elysium**: buy on the HyperCore asks (taker fee), sell for USDC on Elysium.
+- **Elysium → HL**: buy with USDC on Elysium, sell into the HyperCore bids
+  (taker fee). Assumes the USDC is already on Elysium and counts it at $1.
+
+The directions take turns, so HYPE costs one HyperCore book and one Kyber quote
+per round. Both show in the pinned message and in `/status`; `/hype` prints
+them, `/hype 1` pushes when either side is above 1 %, `/hype off` stops that.
+
 ## Alerts
 
 **GO** — spread ≥ `GO_SPREAD_PCT` *and* some chain can take the money back out

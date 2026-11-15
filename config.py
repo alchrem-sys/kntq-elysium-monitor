@@ -26,6 +26,11 @@ USDC_ELYSIUM = "0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65"
 # HyperCore spot pair KNTQ/USDC, as app.hyperliquid.xyz/trade/KNTQ/USDC.
 HYPERCORE_KNTQ_USDC = "@334"
 
+# HyperCore spot pair HYPE/USDC (spotMeta: universe "@107" = tokens [150, 0]), checked 2026-11-15.
+HYPERCORE_HYPE_USDC = "@107"
+HYPE_USDC_SPOT_URL = "https://app.hyperliquid.xyz/trade/HYPE/USDC"
+KYBER_HYPE_URL = "https://kyberswap.com/swap/elysium/hype-to-usdc"
+
 # Native HYPE is spelled differently by each API.
 KYBER_NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 LIFI_NATIVE = "0x0000000000000000000000000000000000000000"

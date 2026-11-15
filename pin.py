@@ -20,7 +20,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from config import BRIDGE_URL, HYPE_SPOT_URL
+from config import BRIDGE_URL, HYPE_SPOT_URL, HYPE_USDC_SPOT_URL, KYBER_HYPE_URL
 
 log = logging.getLogger("pin")
 
@@ -43,7 +43,8 @@ def _now_local() -> str:
 
 
 class SpreadPin:
-    def __init__(self, cfg, store, tg, runtime, snapshot):
+    def __init__(self, cfg, store, tg, runtime, snapshot, hype=None):
+        self.hype = hype
         self.cfg = cfg
         self.store = store
         self.tg = tg
@@ -111,9 +112,10 @@ class SpreadPin:
         size = self.size
         snap = self.snapshot() or {}
         ts = snap.get("spread_ts")
+        hype = ([""] + self.hype.lines(STALE_S)) if self.hype is not None else []
         if ts is None or abs((snap.get("size") or 0) - size) > 0.5:
-            return (f"📌 <b>KNTQ спред · ${size:,.0f}</b>\n"
-                    f"⏳ рахую перше котирування…\n<i>{_now_local()}</i>")
+            return "\n".join([f"📌 <b>KNTQ спред · ${size:,.0f}</b>", "⏳ рахую перше котирування…"]
+                             + hype + [f"<i>{_now_local()}</i>"])
         spread = snap["spread"]
         sell = snap["sell_used"]
         net_usd = size * (1 + spread / 100) * (1 - FOMO_PCT / 100) - size
@@ -132,13 +134,17 @@ class SpreadPin:
         stamp = datetime.fromtimestamp(ts, WARSAW).strftime("%H:%M:%S")
         if age > STALE_S:
             lines.append(f"⏳ котирування {age:.0f}с тому — Kyber пригальмовує, тримаю останнє")
+        lines += hype
         lines.append(f"<i>котирування {stamp} · поріг {go:.2f}%</i>")
         return "\n".join(lines)
 
     def _buttons(self):
-        return {"inline_keyboard": [[{"text": "Hype Spot", "url": HYPE_SPOT_URL},
-                                     {"text": "Bridge", "url": BRIDGE_URL}],
-                                    [{"text": "Kyber", "url": KYBER_SWAP_URL}]]}
+        rows = [[{"text": "KNTQ Spot", "url": HYPE_SPOT_URL}, {"text": "Bridge", "url": BRIDGE_URL}],
+                [{"text": "Kyber KNTQ", "url": KYBER_SWAP_URL}]]
+        if self.hype is not None:
+            rows[0].insert(1, {"text": "HYPE Spot", "url": HYPE_USDC_SPOT_URL})
+            rows[1].append({"text": "Kyber HYPE", "url": KYBER_HYPE_URL})
+        return {"inline_keyboard": rows}
 
     async def _publish(self, text: str) -> None:
         mid = self.rec.get("message_id")

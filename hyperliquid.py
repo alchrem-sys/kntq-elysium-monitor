@@ -68,6 +68,38 @@ class HyperCore:
                 return None
         return None
 
+    async def sides(self) -> tuple[list, list] | None:
+        """(bids, asks) of the pair, best first, from one request."""
+        book = await self._post({"type": "l2Book", "coin": self.coin})
+        levels = book.get("levels") if isinstance(book, dict) else None
+        if not levels or len(levels) < 2 or not levels[0] or not levels[1]:
+            return None
+        return levels[0], levels[1]
+
+    @staticmethod
+    def sell_into(bids: list, qty: float, taker_fee_pct: float) -> float | None:
+        """Dollars received for selling `qty` into the bids, after the taker fee. None if too thin."""
+        remaining, got = qty, 0.0
+        for level in bids:
+            take = min(remaining, float(level["sz"]))
+            got += take * float(level["px"])
+            remaining -= take
+            if remaining <= 1e-12:
+                return got * (1 - taker_fee_pct / 100.0)
+        return None
+
+    @staticmethod
+    def buy_from(asks: list, notional_usd: float, taker_fee_pct: float) -> tuple[float, float] | None:
+        """(quantity bought, dollars paid with the taker fee) for `notional_usd` of asks. None if too thin."""
+        remaining, qty = notional_usd, 0.0
+        for level in asks:
+            px, value = float(level["px"]), float(level["px"]) * float(level["sz"])
+            if value >= remaining:
+                return qty + remaining / px, notional_usd * (1 + taker_fee_pct / 100.0)
+            qty += float(level["sz"])
+            remaining -= value
+        return None
+
     async def buy_fill(self, notional_usd: float, taker_fee_pct: float) -> Fill | None:
         """What buying `notional_usd` of the base token actually costs right now."""
         book = await self._post({"type": "l2Book", "coin": self.coin})

@@ -46,6 +46,7 @@ from config import (
     CHAIN_NAMES,
     HYPE_SPOT_URL,
     Config,
+    HYPERCORE_HYPE_USDC,
     HYPERCORE_KNTQ_USDC,
     KNTQ_ELYSIUM,
     KYBER_NATIVE,
@@ -57,10 +58,11 @@ from markets import Exit, Markets, RateLimited
 from notify import Pushover, Telegram
 from routing import exit_order, remember
 from state import Store
+from hype import HypeScan
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.5.3"
+VERSION = "1.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -239,7 +241,7 @@ async def check_only(cfg: Config, store: Store, tg: Telegram, spread: float,
 
 
 async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
-                      store: Store, tg: Telegram, pin=None) -> None:
+                      store: Store, tg: Telegram, pin=None, hype=None) -> None:
     """Fast loop: spread only, every few seconds.
 
     Two requests a round -- the HyperCore book and one Kyber quote -- and no
@@ -253,10 +255,10 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
     last_log_ts = 0.0
     while not _stop.is_set():
         interval = rt.spread_poll_seconds
+        # One quote feeds /only and the pinned message: the lap size is
+        # the pin's when the pin is on, so the pin costs no extra requests.
+        size = pin.size if pin is not None and pin.on else cfg.notional_usd
         try:
-            # One quote feeds /only and the pinned message: the lap size is
-            # the pin's when the pin is on, so the pin costs no extra requests.
-            size = pin.size if pin is not None and pin.on else cfg.notional_usd
             fill = await core.buy_fill(size, cfg.taker_fee_pct)
             q = None
             if fill is not None and fill.filled:
@@ -287,6 +289,20 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
         except Exception as exc:  # noqa: BLE001 - a bad round must not kill the loop
             fails += 1
             log.warning("Fast spread round failed: %s", exc)
+        if hype is not None:
+            try:        # its own guard: a HYPE miss must not slow the KNTQ loop down
+                h = await hype.round(size)
+                if h is not None:
+                    _snapshot["hype_ts"] = h["ts"]
+                    if pin is not None:
+                        pin.kick()
+                    cur = tuple(round(h[d]["pct"], 1) if d in h else None for d in ("fwd", "rev"))
+                    if cur != _snapshot.get("hype_logged"):
+                        _snapshot["hype_logged"] = cur
+                        log.info("hype spread HL->Ely %s | Ely->HL %s", *(
+                            f"{h[d]['pct']:+.2f}%" if d in h else "-" for d in ("fwd", "rev")))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("HYPE round failed: %s", exc)
         # Back off when a source is refusing us, recover as soon as it answers.
         delay = interval if fails == 0 else min(60.0, interval * (2 ** min(fails, 4)))
         try:
@@ -504,8 +520,9 @@ async def run() -> int:
         global _push
         _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
         whales = WhaleWatch(store, tg, _push, http)
-        pin = SpreadPin(cfg, store, tg, rt, snapshot)
-        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push, whales, pin)
+        hype = HypeScan(cfg, HyperCore(HYPERCORE_HYPE_USDC, http), markets, store, tg, push)
+        pin = SpreadPin(cfg, store, tg, rt, snapshot, hype)
+        commands = CommandServer(cfg, http, markets, store, rt, tg, snapshot, _push, whales, pin, hype)
 
         await tg.send(
             f"▶️ <b>Монітор KNTQ Elysium</b>  v{VERSION}\n"
@@ -524,6 +541,8 @@ async def run() -> int:
             f"<code>/status</code> — поточний стан\n"
             f"<code>/pin 5000</code> — закріплений спред, оновлюється сам "
             f"(<code>/pin off</code>)\n"
+            f"<code>/hype</code> — спред HYPE між HL і Elysium в обидва боки "
+            f"(<code>/hype 1</code> — пуш від 1%)\n"
             f"<code>/whales</code> — кити KNTQ: пуш, коли продають маркетом від "
             f"${whales.min_usd:,.0f}",
             alert_buttons(None, cfg.notional_usd),
@@ -531,7 +550,7 @@ async def run() -> int:
 
         tasks = [
             asyncio.create_task(monitor_loop(cfg, rt, core, markets, store, tg)),
-            asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg, pin)),
+            asyncio.create_task(spread_loop(cfg, rt, core, markets, store, tg, pin, hype)),
             asyncio.create_task(commands.run(_stop)),
             asyncio.create_task(whales.run(_stop)),
             asyncio.create_task(pin.run(_stop)),

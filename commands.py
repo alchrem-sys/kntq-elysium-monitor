@@ -19,6 +19,7 @@ import httpx
 from config import Config
 from markets import Markets, RateLimited
 from routing import exit_order, remember
+from hype import HYPE_RE
 from pin import PIN_RE
 from whales import WHALE_RE
 
@@ -69,7 +70,9 @@ class Runtime:
 
 class CommandServer:
     def __init__(self, cfg: Config, http: httpx.AsyncClient, markets: Markets,
-                 store, runtime: Runtime, tg, snapshot, pushover=None, whales=None, pin=None):
+                 store, runtime: Runtime, tg, snapshot, pushover=None, whales=None, pin=None,
+                 hype=None):
+        self.hype = hype
         self.cfg = cfg
         self.http = http
         self.markets = markets
@@ -206,6 +209,11 @@ class CommandServer:
         elif (m := PIN_RE.match(text)) and self.pin is not None:
             if await gate():
                 changed = await self.pin.command(m.group(1))
+        elif (m := HYPE_RE.match(text)) and self.hype is not None:
+            if m.group(1) is None:
+                await self.hype.command(None)        # reading the spread is open, like /status
+            elif await gate():
+                changed = await self.hype.command(m.group(1))
         elif (m := WHALE_RE.match(text)) and self.whales is not None:
             if await gate():
                 changed = await self.whales.command(m.group(2))
@@ -437,6 +445,7 @@ class CommandServer:
             f"Купівля: {snap.get('buy_px', 0):.5f} · книга ${snap.get('depth', 0):,.0f}\n"
             f"Продаж: {snap.get('carrier', '?')} → {snap.get('final', 0):,.2f} USDC\n"
             f"Вихід: {snap.get('exit', 'не перевірявся')}"
+            + ("\n\n" + "\n".join(self.hype.lines()) if self.hype is not None else "")
         )
 
     async def _cmd_pulls(self) -> None:
