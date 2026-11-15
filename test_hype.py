@@ -34,7 +34,7 @@ class Markets:
         self.sell_usdc, self.buy_hype = 4942.923919, 76.319341
         self.calls = []
 
-    async def quote_elysium(self, tin, tout, raw):
+    async def quote_elysium(self, tin, tout, raw, soft=False):
         self.calls.append((tin, tout, raw))
         if tin == KYBER_NATIVE and tout == USDC_ELYSIUM:
             return (int(self.sell_usdc * 1e6), 4) if self.sell_usdc else None
@@ -110,7 +110,7 @@ async def main():
     mk.sell_usdc = None
     before = dict(h.snap["fwd"])
     assert await h.round(5000.0) is None and h.snap["fwd"] == before and len(pushes) == 3
-    h.snap["fwd"]["ts"] -= 100
+    h.snap["fwd"]["ts"] -= 200
     assert "⏳" in "\n".join(h.lines())
     core.ok = False
     assert await h.round(5000.0) is None                    # no book: nothing changes

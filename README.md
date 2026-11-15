@@ -80,8 +80,8 @@ for the same lap size as the pin, in both directions:
 - **Elysium → HL**: buy with USDC on Elysium, sell into the HyperCore bids
   (taker fee). Assumes the USDC is already on Elysium and counts it at $1.
 
-The directions take turns, so HYPE costs one HyperCore book and one Kyber quote
-per round. Both show in the pinned message and in `/status`; `/hype` prints
+Kyber refuses above roughly ten requests a minute and KNTQ uses six, so HYPE gets one quote every third round, the directions taking turns (each refreshed about once a minute).
+Both show in the pinned message and in `/status`; `/hype` prints
 them, `/hype 1` pushes when either side is above 1 %, `/hype off` stops that.
 
 ## Alerts

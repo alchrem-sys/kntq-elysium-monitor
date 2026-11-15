@@ -58,11 +58,11 @@ from markets import Exit, Markets, RateLimited
 from notify import Pushover, Telegram
 from routing import exit_order, remember
 from state import Store
-from hype import HypeScan
+from hype import HYPE_EVERY, HypeScan
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,7 +250,7 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
     When the spread nears the exit-alert threshold it wakes the full tick
     rather than waiting out its two-minute cycle.
     """
-    fails = 0
+    fails = rounds = 0
     last_logged: float | None = None
     last_log_ts = 0.0
     while not _stop.is_set():
@@ -289,11 +289,17 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
         except Exception as exc:  # noqa: BLE001 - a bad round must not kill the loop
             fails += 1
             log.warning("Fast spread round failed: %s", exc)
-        if hype is not None:
+        # Back off when a source is refusing us, recover as soon as it answers.
+        delay = interval if fails == 0 else min(60.0, interval * (2 ** min(fails, 4)))
+        rounds += 1
+        if hype is not None and fails == 0 and rounds % HYPE_EVERY == 0:
+            # Halfway to the next KNTQ quote, so the two never hit Kyber back to back.
+            if await _sleep(delay / 2):
+                break
+            delay /= 2
             try:        # its own guard: a HYPE miss must not slow the KNTQ loop down
                 h = await hype.round(size)
                 if h is not None:
-                    _snapshot["hype_ts"] = h["ts"]
                     if pin is not None:
                         pin.kick()
                     cur = tuple(round(h[d]["pct"], 1) if d in h else None for d in ("fwd", "rev"))
@@ -303,12 +309,17 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
                             f"{h[d]['pct']:+.2f}%" if d in h else "-" for d in ("fwd", "rev")))
             except Exception as exc:  # noqa: BLE001
                 log.warning("HYPE round failed: %s", exc)
-        # Back off when a source is refusing us, recover as soon as it answers.
-        delay = interval if fails == 0 else min(60.0, interval * (2 ** min(fails, 4)))
-        try:
-            await asyncio.wait_for(_stop.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
+        if await _sleep(delay):
+            break
+
+
+async def _sleep(seconds: float) -> bool:
+    """Wait, or return True at once when the service is stopping."""
+    try:
+        await asyncio.wait_for(_stop.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 async def tick(cfg: Config, rt: Runtime, core: HyperCore, markets: Markets,

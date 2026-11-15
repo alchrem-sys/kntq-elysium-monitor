@@ -97,8 +97,11 @@ class Markets:
         self._kyber_cooldown = KYBER_COOLDOWN_S[0]
         self.kyber_429 = 0
 
-    async def _kyber_get(self, params: dict) -> httpx.Response | None:
-        """Rate-gated Kyber GET. None while cooling down after a 429."""
+    async def _kyber_get(self, params: dict, soft: bool = False) -> httpx.Response | None:
+        """Rate-gated Kyber GET. None while cooling down after a 429.
+
+        `soft` marks a secondary quote (HYPE): its 429 costs one short pause and
+        does not lengthen the cooldown the KNTQ quote has to wait out."""
         async with self._kyber_lock:
             now = time.monotonic()
             if now < self._kyber_cool_until:
@@ -108,6 +111,10 @@ class Markets:
             self._kyber_next = time.monotonic() + KYBER_MIN_GAP_S
             self.other_requests += 1
             r = await self.http.get(f"{KYBER_BASE}/routes", params=params, headers=KYBER_HEADERS)
+            if r.status_code == 429 and soft:
+                self.kyber_429 += 1
+                self._kyber_cool_until = time.monotonic() + KYBER_COOLDOWN_S[0]
+                return None
             if r.status_code == 429:
                 self.kyber_429 += 1
                 self._kyber_cool_until = time.monotonic() + self._kyber_cooldown
@@ -121,13 +128,13 @@ class Markets:
     # ---------- Elysium sell side ----------
 
     async def quote_elysium(self, token_in: str, token_out: str,
-                            raw_amount: str) -> tuple[int, int] | None:
+                            raw_amount: str, soft: bool = False) -> tuple[int, int] | None:
         """Raw Kyber quote on Elysium. Returns (amount_out_raw, hops)."""
         params = {"tokenIn": token_in, "tokenOut": token_out,
                   "amountIn": raw_amount, "gasInclude": "true"}
-        for attempt in range(3):
+        for attempt in range(1 if soft else 3):
             try:
-                r = await self._kyber_get(params)
+                r = await self._kyber_get(params, soft)
                 if r is None:
                     return None  # cooling down after a 429
                 if r.is_success:

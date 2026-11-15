@@ -7,9 +7,10 @@ HYPE is Elysium's native coin, so KyberSwap takes the native placeholder. The
 second direction assumes the USDC is already on Elysium (e.g. after a KNTQ
 lap) and counts it at one dollar; Elysium USDC usually trades a bit under.
 
-The two directions take turns: one HyperCore book and one Kyber quote per
-round of the fast spread loop, through the shared Kyber gate, after the KNTQ
-quote, so KNTQ keeps its place in the rate limit.
+Kyber's Elysium endpoint starts refusing at roughly ten requests a minute, and
+the KNTQ quote already uses six. So HYPE takes one quote every HYPE_EVERY-th
+round of the fast loop, halfway between two KNTQ quotes, the two directions
+taking turns: each direction is refreshed about once a minute.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from config import BRIDGE_URL, HYPE_USDC_SPOT_URL, KYBER_HYPE_URL, KYBER_NATIVE,
 log = logging.getLogger("hype")
 
 HYPE_RE = re.compile(r"^/hype(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
+HYPE_EVERY = 3              # fast-loop rounds per HYPE quote
 ESCALATION_PCT = 0.5        # fire again when the spread climbs this much above the last alert
 DIRS = {"fwd": "HL → Elysium", "rev": "Elysium → HL"}
 
@@ -57,13 +59,13 @@ class HypeScan:
             bought = self.core.buy_from(asks, size, fee)
             if bought:
                 qty, cost = bought
-                q = await self.markets.quote_elysium(KYBER_NATIVE, USDC_ELYSIUM, str(int(qty * 1e18)))
+                q = await self.markets.quote_elysium(KYBER_NATIVE, USDC_ELYSIUM, str(int(qty * 1e18)), soft=True)
                 if q:
                     usdc = q[0] / 1e6
                     side = {"pct": 100.0 * (usdc / cost - 1.0), "buy_px": cost / qty,
                             "sell_px": usdc / qty, "out": usdc}
         else:
-            q = await self.markets.quote_elysium(USDC_ELYSIUM, KYBER_NATIVE, str(int(size * 1e6)))
+            q = await self.markets.quote_elysium(USDC_ELYSIUM, KYBER_NATIVE, str(int(size * 1e6)), soft=True)
             if q:
                 qty = q[0] / 1e18
                 got = self.core.sell_into(bids, qty, fee)
@@ -100,7 +102,7 @@ class HypeScan:
             self.store.update("hype", **{f"at_{d}": None})
             log.info("HYPE %s re-armed at %+.2f%%", d, spread)
 
-    def lines(self, stale_s: float = 45.0) -> list[str]:
+    def lines(self, stale_s: float = 150.0) -> list[str]:
         """Block for the pinned message and /status."""
         s = self.snap
         if not s:

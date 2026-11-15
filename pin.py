@@ -112,7 +112,7 @@ class SpreadPin:
         size = self.size
         snap = self.snapshot() or {}
         ts = snap.get("spread_ts")
-        hype = ([""] + self.hype.lines(STALE_S)) if self.hype is not None else []
+        hype = ([""] + self.hype.lines()) if self.hype is not None else []
         if ts is None or abs((snap.get("size") or 0) - size) > 0.5:
             return "\n".join([f"📌 <b>KNTQ спред · ${size:,.0f}</b>", "⏳ рахую перше котирування…"]
                              + hype + [f"<i>{_now_local()}</i>"])
