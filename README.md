@@ -73,16 +73,14 @@ trustworthy — a spot mark would quietly decide the answer.
 
 ## HYPE spread
 
-The fast loop also measures HYPE between HyperCore spot (`@107`) and Elysium,
-for the same lap size as the pin, in both directions:
+The fast loop also measures HYPE from HyperCore spot (`@107`) to Elysium for
+the same lap size as the pin: buy on the HyperCore asks (taker fee), sell for
+USDC on Elysium. Kyber refuses above roughly ten requests a minute and KNTQ
+uses six, so HYPE gets one quote every third round (about every 30 s).
 
-- **HL → Elysium**: buy on the HyperCore asks (taker fee), sell for USDC on Elysium.
-- **Elysium → HL**: buy with USDC on Elysium, sell into the HyperCore bids
-  (taker fee). Assumes the USDC is already on Elysium and counts it at $1.
-
-Kyber refuses above roughly ten requests a minute and KNTQ uses six, so HYPE gets one quote every third round, the directions taking turns (each refreshed about once a minute).
-Both show in the pinned message and in `/status`; `/hype` prints
-them, `/hype 1` pushes when either side is above 1 %, `/hype off` stops that.
+It shows in the pinned message and in `/status`; `/hype` prints it. A Pushover
+push and a group message fire above 1 % (`/hype 1.5` changes the threshold,
+`/hype off` stops it), again when the spread climbs another 0.5 %.
 
 ## Alerts
 

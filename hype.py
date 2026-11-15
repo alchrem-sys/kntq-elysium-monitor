@@ -1,16 +1,11 @@
-"""HYPE spread between HyperCore spot and Elysium, both ways.
+"""HYPE spread from HyperCore spot to Elysium: buy HYPE on the HyperCore book
+(taker fee), bridge, sell it for USDC on Elysium.
 
-  HL -> Elysium   buy HYPE on the HyperCore book, sell it for USDC on Elysium
-  Elysium -> HL   buy HYPE with USDC on Elysium, sell it on the HyperCore book
-
-HYPE is Elysium's native coin, so KyberSwap takes the native placeholder. The
-second direction assumes the USDC is already on Elysium (e.g. after a KNTQ
-lap) and counts it at one dollar; Elysium USDC usually trades a bit under.
+HYPE is Elysium's native coin, so KyberSwap takes the native placeholder.
 
 Kyber's Elysium endpoint starts refusing at roughly ten requests a minute, and
 the KNTQ quote already uses six. So HYPE takes one quote every HYPE_EVERY-th
-round of the fast loop, halfway between two KNTQ quotes, the two directions
-taking turns: each direction is refreshed about once a minute.
+round of the fast loop, halfway between two KNTQ quotes: about every 30 s.
 """
 from __future__ import annotations
 
@@ -25,7 +20,7 @@ log = logging.getLogger("hype")
 HYPE_RE = re.compile(r"^/hype(?:@\S+)?(?:\s+(off|[0-9]*\.?[0-9]+)\s*%?)?\s*$", re.I)
 HYPE_EVERY = 3              # fast-loop rounds per HYPE quote
 ESCALATION_PCT = 0.5        # fire again when the spread climbs this much above the last alert
-DIRS = {"fwd": "HL → Elysium", "rev": "Elysium → HL"}
+DEFAULT_PCT = 1.0           # push threshold until /hype sets another
 
 
 def buttons() -> list[list[dict]]:
@@ -38,108 +33,89 @@ class HypeScan:
         self.cfg, self.core, self.markets = cfg, core, markets
         self.store, self.tg, self.push = store, tg, push
         self.snap: dict = {}
-        self._turn = 0
 
     @property
     def rec(self) -> dict:
         return self.store.get("hype")
 
+    @property
+    def pct(self) -> float | None:
+        """Push threshold; None when switched off."""
+        rec = self.rec
+        if rec.get("off"):
+            return None
+        return float(rec.get("pct") or DEFAULT_PCT)
+
     async def round(self, size: float) -> dict | None:
-        """Measure one direction per call, taking turns, so HYPE adds a single Kyber
-        request to each round of the fast loop. The other side keeps its last reading."""
-        fee = self.cfg.taker_fee_pct
+        """What a lap of `size` dollars makes right now. None on a miss: the last reading stays."""
         sides = await self.core.sides()
         if sides is None:
             return None
-        bids, asks = sides
-        which = "fwd" if self._turn % 2 == 0 else "rev"
-        self._turn += 1
-        side = None
-        if which == "fwd":
-            bought = self.core.buy_from(asks, size, fee)
-            if bought:
-                qty, cost = bought
-                q = await self.markets.quote_elysium(KYBER_NATIVE, USDC_ELYSIUM, str(int(qty * 1e18)), soft=True)
-                if q:
-                    usdc = q[0] / 1e6
-                    side = {"pct": 100.0 * (usdc / cost - 1.0), "buy_px": cost / qty,
-                            "sell_px": usdc / qty, "out": usdc}
-        else:
-            q = await self.markets.quote_elysium(USDC_ELYSIUM, KYBER_NATIVE, str(int(size * 1e6)), soft=True)
-            if q:
-                qty = q[0] / 1e18
-                got = self.core.sell_into(bids, qty, fee)
-                if got:
-                    side = {"pct": 100.0 * (got / size - 1.0), "buy_px": size / qty,
-                            "sell_px": got / qty, "out": got}
-        if side is None:
-            return None                     # Kyber cooling down or a thin book: the last reading stays
-        side["ts"] = time.time()
-        keep = {d: v for d, v in self.snap.items() if d in DIRS and self.snap.get("size") == size}
-        self.snap = {**keep, which: side, "size": size, "ts": side["ts"]}
-        await self._alert(which, side, size)
+        bought = self.core.buy_from(sides[1], size, self.cfg.taker_fee_pct)
+        if not bought:
+            return None
+        qty, cost = bought
+        q = await self.markets.quote_elysium(KYBER_NATIVE, USDC_ELYSIUM, str(int(qty * 1e18)), soft=True)
+        if not q:
+            return None                     # Kyber cooling down
+        usdc = q[0] / 1e6
+        self.snap = {"size": size, "ts": time.time(), "pct": 100.0 * (usdc / cost - 1.0),
+                     "buy_px": cost / qty, "sell_px": usdc / qty, "out": usdc, "qty": qty}
+        await self._alert(self.snap)
         return self.snap
 
-    async def _alert(self, d: str, side: dict, size: float) -> None:
-        pct = self.rec.get("pct")
+    async def _alert(self, s: dict) -> None:
+        pct = self.pct
         if not pct:
             return
-        label, spread, fired_at = DIRS[d], side["pct"], self.rec.get(f"at_{d}")
+        spread, fired_at, size = s["pct"], self.rec.get("at"), s["size"]
         if spread >= pct and (fired_at is None or spread >= fired_at + ESCALATION_PCT):
-            self.store.update("hype", **{f"at_{d}": round(spread, 3)})
+            self.store.update("hype", at=round(spread, 3))
             gain = size * spread / 100
-            how = (f"Купити на HL по {side['buy_px']:.3f}, продати на Elysium по {side['sell_px']:.3f}"
-                   if d == "fwd" else
-                   f"Купити на Elysium по {side['buy_px']:.3f}, продати на HL по {side['sell_px']:.3f}")
-            await self.push(f"HYPE {label} {spread:+.2f}%",
-                            f"Поріг {pct:.2f}%. ${size:,.0f} → {side['out']:,.2f} ({gain:+,.0f}$ валом).",
+            await self.push(f"HYPE спред {spread:+.2f}%",
+                            f"Поріг {pct:.2f}%. ${size:,.0f} → {s['out']:,.2f} USDC на Elysium "
+                            f"({gain:+,.0f}$ валом).",
                             url=HYPE_USDC_SPOT_URL, url_title="HYPE Spot")
-            await self.tg.send(f"📈 <b>HYPE {label}: {spread:+.2f}%</b>  (поріг {pct:.2f}%)\n\n"
-                               f"{how}\n${size:,.0f} → <b>{side['out']:,.2f}</b> · валом {gain:+,.0f}$",
-                               buttons())
-            log.info("HYPE %s alert at %+.2f%%", d, spread)
+            await self.tg.send(f"📈 <b>HYPE спред {spread:+.2f}%</b>  (поріг {pct:.2f}%)\n\n"
+                               f"Купівля HL {s['buy_px']:.3f} (з комісією)\n"
+                               f"${size:,.0f} → {s['qty']:,.2f} HYPE → <b>{s['out']:,.2f} USDC</b> на Elysium\n"
+                               f"Валом {gain:+,.0f}$", buttons())
+            log.info("HYPE alert at %+.2f%%", spread)
         elif fired_at is not None and spread < pct - self.cfg.clear_margin_pct:
-            self.store.update("hype", **{f"at_{d}": None})
-            log.info("HYPE %s re-armed at %+.2f%%", d, spread)
+            self.store.update("hype", at=None)
+            log.info("HYPE re-armed at %+.2f%%", spread)
 
-    def lines(self, stale_s: float = 150.0) -> list[str]:
-        """Block for the pinned message and /status."""
+    def lines(self, stale_s: float = 100.0) -> list[str]:
+        """Block for the pinned message, /status and /hype."""
         s = self.snap
         if not s:
-            return ["<b>HYPE</b>: ще рахую…"]
-        pct = self.rec.get("pct")
-        out = [f"<b>HYPE спред · ${s['size']:,.0f}</b>"]
-        for d, label in DIRS.items():
-            side = s.get(d)
-            if not side:
-                out.append(f"⏳ {label}: немає котирування")
-                continue
-            mark = "🟢" if (pct and side["pct"] >= pct) else ("🟡" if side["pct"] > 0 else "🔴")
-            age = time.time() - side["ts"]
-            out.append(f"{mark} {label}: <b>{side['pct']:+.2f}%</b> ({size_gain(s['size'], side['pct'])}) · "
-                       f"{side['buy_px']:.3f} → {side['sell_px']:.3f}" + (f" ⏳{age:.0f}с" if age > stale_s else ""))
+            return ["<b>HYPE спред</b>", "⏳ рахую перше котирування…"]
+        pct, spread = self.pct, s["pct"]
+        mark = "🟢" if (pct and spread >= pct) else ("🟡" if spread > 0 else "🔴")
+        out = [f"<b>HYPE спред · ${s['size']:,.0f}</b>",
+               f"{mark} <b>{spread:+.2f}%</b>  →  <b>{s['size'] * spread / 100:+,.0f}$</b>",
+               f"Купівля HL: {s['buy_px']:.3f} (з комісією)",
+               f"Продаж Elysium: {s['sell_px']:.3f} → {s['out']:,.2f} USDC"]
+        age = time.time() - s["ts"]
+        if age > stale_s:
+            out.append(f"⏳ котирування HYPE {age:.0f}с тому")
         return out
 
     async def command(self, arg: str | None) -> bool:
-        cur = self.rec.get("pct")
+        cur = self.pct
         if arg is None:
             state = f"пуш від <b>{cur:.2f}%</b>" if cur else "пуш вимкнено"
             await self.tg.send("\n".join(self.lines()) + f"\n\nАлерт: {state}\n"
-                               "<code>/hype 1</code> — пуш, коли будь-який бік вище 1% · <code>/hype off</code>",
-                               buttons())
+                               "<code>/hype 1</code> — поріг пуша · <code>/hype off</code>", buttons())
             return False
         if arg.lower() == "off":
-            self.store.update("hype", pct=None, at_fwd=None, at_rev=None)
-            await self.tg.send("🔕 Алерт по HYPE вимкнено. Спред далі видно в закріпленому і в /hype.")
+            self.store.update("hype", off=True, at=None)
+            await self.tg.send("🔕 Пуш по HYPE вимкнено. Спред далі видно в закріпленому і в /hype.")
             return True
         pct = float(arg)
         if not 0.1 <= pct <= 50:
             await self.tg.send("Поріг має бути між 0.1% і 50%.")
             return False
-        self.store.update("hype", pct=pct, at_fwd=None, at_rev=None)
-        await self.tg.send(f"👁 HYPE: пуш, коли HL → Elysium або Elysium → HL вище <b>{pct:.2f}%</b>.")
+        self.store.update("hype", pct=pct, off=False, at=None)
+        await self.tg.send(f"👁 HYPE: пуш у Pushover, коли спред HL → Elysium вище <b>{pct:.2f}%</b>.")
         return True
-
-
-def size_gain(size: float, pct: float) -> str:
-    return f"{size * pct / 100:+,.0f}$"

@@ -62,7 +62,7 @@ from hype import HYPE_EVERY, HypeScan
 from pin import SpreadPin
 from whales import WhaleWatch
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,11 +302,11 @@ async def spread_loop(cfg: Config, rt, core: HyperCore, markets: Markets,
                 if h is not None:
                     if pin is not None:
                         pin.kick()
-                    cur = tuple(round(h[d]["pct"], 1) if d in h else None for d in ("fwd", "rev"))
+                    cur = round(h["pct"], 1)
                     if cur != _snapshot.get("hype_logged"):
                         _snapshot["hype_logged"] = cur
-                        log.info("hype spread HL->Ely %s | Ely->HL %s", *(
-                            f"{h[d]['pct']:+.2f}%" if d in h else "-" for d in ("fwd", "rev")))
+                        log.info("hype spread %+.2f%% | buy %.3f | sell %.2f USDC",
+                                 h["pct"], h["buy_px"], h["out"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("HYPE round failed: %s", exc)
         if await _sleep(delay):
@@ -528,6 +528,15 @@ async def run() -> int:
         markets = Markets(cfg, http)
         tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, http, cfg.telegram_thread_id)
         rt = Runtime(cfg, store)
+        # 2026-11-15, once: the owner asked for a Pushover alert above 1% on both KNTQ and HYPE.
+        if not store.get("runtime").get("push_1pct"):
+            store.update("only", pct=1.0, fired=False, fired_at=None)
+            store.update("hype", pct=1.0, off=False, at=None)
+            store.update("runtime", push_1pct=True)
+            try:
+                await store.save_settings()
+            except Exception as exc:  # noqa: BLE001
+                log.error("Could not save the 1%% alert thresholds: %s", exc)
         global _push
         _push = Pushover(cfg.pushover_app_token, http, store, cfg.pushover_priority)
         whales = WhaleWatch(store, tg, _push, http)
@@ -552,8 +561,8 @@ async def run() -> int:
             f"<code>/status</code> — поточний стан\n"
             f"<code>/pin 5000</code> — закріплений спред, оновлюється сам "
             f"(<code>/pin off</code>)\n"
-            f"<code>/hype</code> — спред HYPE між HL і Elysium в обидва боки "
-            f"(<code>/hype 1</code> — пуш від 1%)\n"
+            f"<code>/hype</code> — спред HYPE з HL в Elysium "
+            f"(<code>/hype 1</code> — поріг пуша)\n"
             f"<code>/whales</code> — кити KNTQ: пуш, коли продають маркетом від "
             f"${whales.min_usd:,.0f}",
             alert_buttons(None, cfg.notional_usd),
