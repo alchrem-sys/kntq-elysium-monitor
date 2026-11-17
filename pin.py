@@ -120,7 +120,7 @@ class SpreadPin:
         sell = snap["sell_used"]
         net_usd = size * (1 + spread / 100) * (1 - FOMO_PCT / 100) - size
         net_pct = 100.0 * net_usd / size
-        go = self.runtime.go_spread_pct
+        go = self.store.get("only").get("pct") or 1.0
         mark = "🟢" if spread >= go else ("🟡" if spread > 0 else "🔴")
         lines = [
             f"📌 <b>KNTQ спред · ${size:,.0f}</b>",

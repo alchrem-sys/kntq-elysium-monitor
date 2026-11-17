@@ -1,10 +1,9 @@
-"""Offline harness driving the real tick logic with recorded live data.
+"""Offline harness driving the real spread loop and commands with recorded live data.
 
-The build sandbox has no egress to api.hyperliquid.xyz, li.quest or kyberswap,
-so the HTTP boundary is stubbed with numbers those services actually returned
-on 2026-11-10: the real @334 ask book, real KNTQ sell quotes, and exit costs
-in the range measured that evening. Everything below the HTTP layer is
-production code.
+The build sandbox has no egress to api.hyperliquid.xyz or kyberswap, so the
+HTTP boundary is stubbed with numbers those services returned on 2026-11-10:
+the real @334 ask book and real KNTQ sell quotes. Everything below the HTTP
+layer is production code.
 """
 from __future__ import annotations
 
@@ -18,18 +17,13 @@ os.environ.update(
     REDIS_URL="rediss://unused",
     PUSHOVER_APP_TOKEN="app-test-token",
     NOTIONAL_USD="3000",
-    GO_SPREAD_PCT="3.0",
-    URGENT_SPREAD_PCT="5.0",
-    MAX_EXIT_LOSS_PCT="1.0",
-    REQUEST_SPACING_SECONDS="0",
-    ALERT_COOLDOWN_SECONDS="0",
 )
 
 import config  # noqa: E402
 from commands import CommandServer, Runtime  # noqa: E402
 from hyperliquid import HyperCore  # noqa: E402
 import main as M  # noqa: E402
-from main import snapshot, tick  # noqa: E402
+from main import snapshot  # noqa: E402
 from notify import Pushover  # noqa: E402
 from markets import Markets  # noqa: E402
 
@@ -96,18 +90,8 @@ class FakeHttp:
             return R({"data": {"routeSummary": {         # KNTQ -> USDC
                 "amountOut": str(int(amt / 1e18 * PX_USDC * W["mult"] * 1e6)),
                 "route": [1] * 7}}})
-        if "li.quest" in url:
-            chain = int(params["toChain"])
-            carrier = "HYPE" if params["fromToken"].startswith("0x0000") else "USDC"
-            raw = int(params["fromAmount"])
-            face = raw / 1e18 * MID if carrier == "HYPE" else raw / 1e6
-            loss = W["exit"].get((carrier, chain), W["default"])
-            out = face * (1 - loss / 100)
-            return R({"tool": "lifiIntents" if loss < 1 else "relaydepository",
-                      "action": {"toToken": {"decimals": 6}},
-                      "estimate": {"toAmount": str(int(out * 1e6)),
-                                   "toAmountMin": str(int(out * 0.995 * 1e6)),
-                                   "executionDuration": 30}})
+        if "li.quest" in url or "relay.link" in url:
+            raise AssertionError("exit routes must not be queried any more")
         if "getUpdates" in url:
             return R({"result": []})
         return R({}, 404)
@@ -197,61 +181,44 @@ async def main() -> None:
     await cmds._dispatch('/poll 5', friend)
     print('    poll now', rt.spread_poll_seconds)
 
-    print('### 0g. fast spread loop: /only fires from it, and it wakes the full tick')
-    await cmds._dispatch('/only 2', friend)
-    store.get('runtime')['spread_poll_seconds'] = 0.05
-    W["mult"] = 1.03
-    M._wake.clear()
-    task = asyncio.create_task(M.spread_loop(cfg, rt, core, markets, store, tg))
-    await asyncio.sleep(0.4)
-    M._stop.set(); await task; M._stop.clear()
-    print('    wake requested:', M._wake.is_set())
-    store.update('only', pct=None, fired=False, fired_at=None)
+    async def loop(seconds=0.3):
+        store.get('runtime')['spread_poll_seconds'] = 0.05
+        task = asyncio.create_task(M.spread_loop(cfg, rt, core, markets, store, tg))
+        await asyncio.sleep(seconds)
+        M._stop.set(); await task; M._stop.clear()
+
+    print("### 1. Quiet spread -> silence, /status shows it")
     W["mult"] = 1.0
+    sent = len(http.sent)
+    await loop()
+    assert "spread" in snapshot() and abs(snapshot()["spread"] - 1.79) < 0.05, snapshot()
+    await cmds._dispatch('/status', me)
 
-    print("### 1. Quiet spread -> silence")
-    await tick(cfg, rt, core, markets, store, tg, 1)
+    print("\n### 2. /spread 2 is /only 2")
+    await cmds._dispatch('/spread 2', me)
+    assert store.get('only').get('pct') == 2.0
 
-    print("\n### 2. /tell armed, waiting for a $3k exit")
-    await cmds._cmd_tell(None)
-
-    print("\n### 3. Spread lifts above 3% -> TELL fires, then GO with buttons")
+    print("\n### 3. spread above 2% -> push + message, then quiet while it stays")
     W["mult"] = 1.03
-    await tick(cfg, rt, core, markets, store, tg, 2)
+    await loop()
+    fired = store.get('only').get('fired_at')
+    assert fired and fired > 2, store.get('only')
 
-    print("\n### 4. /test -- the full working, in English")
-    await cmds._cmd_test()
-
-    print("\n### 5. /tell must not fire twice")
-    store.data["go"]["armed"] = False
-    await tick(cfg, rt, core, markets, store, tg, 3)
-
-    print("\n### 6. /only 2 -- spread watch, no exit needed")
-    await cmds._cmd_only("2")
-
-    print("\n### 7. spread above 2% -> /gm first, then the numbers")
-    store.data["go"]["armed"] = True          # mute GO so only /only speaks
-    lifi_before = markets.lifi_requests
-    await tick(cfg, rt, core, markets, store, tg, 4)
-
-    print("\n### 8. still above -> must stay silent")
-    await tick(cfg, rt, core, markets, store, tg, 5)
-
-    print("\n### 9. spread climbs another 1%+ -> must fire again (escalation)")
-    W["mult"] = 1.045
-    await tick(cfg, rt, core, markets, store, tg, 6)
-
-    print("\n### 9b. spread falls below the band, then back up -> fires again")
-    W["mult"] = 1.0
-    await tick(cfg, rt, core, markets, store, tg, 7)
+    print("\n### 4. falls below the band, then back up -> message again, no push inside the hour")
+    W["mult"] = 0.99
+    await loop()
+    assert not store.get('only').get('fired')
     W["mult"] = 1.03
-    await tick(cfg, rt, core, markets, store, tg, 8)
+    await loop()
+    assert store.get('only').get('fired')
 
-    print("\n### 10. /only off")
+    print("\n### 5. /only off")
     await cmds._cmd_only("off")
-    await tick(cfg, rt, core, markets, store, tg, 8)
+    assert store.get('only').get('pct') is None
 
-    print(f"\nTelegram payloads: {len(http.sent)}  LI.FI requests: {markets.lifi_requests}")
+    for cmd in ('/pulls', '/tell', '/test'):
+        await cmds._dispatch(cmd, me)           # gone: silently ignored
+    print(f"\nTelegram payloads: {len(http.sent)}  Kyber requests: {markets.kyber_requests}")
 
 
 if __name__ == "__main__":

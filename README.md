@@ -1,75 +1,40 @@
 # kntq-elysium-monitor
 
-Watches the KNTQ round trip between HyperCore spot and Elysium, and sends a
-Telegram alert when a lap is actually worth doing.
+Watches the spread on the KNTQ round trip between HyperCore spot and Elysium
+(and the same for HYPE), keeps it in a pinned Telegram message and alerts when
+it passes a threshold.
 
 ## The cycle
 
 1. Buy KNTQ on HyperCore spot — pair `KNTQ/USDC`, addressed as `@334`
 2. Move it to Elysium 1:1 through the canonical bridge (seconds, gas only)
 3. Sell it on Elysium for USDC at a premium
-4. Bring that USDC back to an EVM chain so the capital can go round again
+4. Take the USDC off Elysium (fomo) and go round again
 
-Step 4 is the binding constraint, and the reason this service exists.
+The monitor prices steps 1 and 3. Exit routes off Elysium are not scanned
+(that part was removed in v1.7.0).
 
-## Why the exit is the hard part
+## How the numbers are produced
 
-Moving value off Elysium is not a swap against a pool. An intent solver fronts
-you its own funds on the destination chain and then spends about six days
-recovering them through the canonical bridge. The price you pay is therefore set
-by whether that solver still holds inventory on a given chain — which makes it a
-cliff, not a depth curve:
+- **Buy price** walks the real ask side of the `@334` order book for the full
+  size and adds the taker fee.
+- **Sell price** is a KyberSwap quote on Elysium for the exact quantity the walk
+  produced, routed across every pool on the chain (through HYPE when that pays).
 
-| Solver inventory on that chain | Cost |
-| --- | --- |
-| available | ~0.3% at any size |
-| drained | ~3% at any size, including $300 |
-
-Splitting the order does not help. The question is never "how big can I go", it
-is "which chain is still open". Measured 2026-11-10: Optimism 0.27% while
-Arbitrum, Base and HyperEVM all sat at ~3.0% after being drained.
-
-The canonical bridge is always available at 0% and about six days. Since what
-sits in that queue is USDC, the wait carries no price risk — only frozen capital.
-
-## Two carriers, and why neither is hardcoded
-
-KNTQ can leave Elysium as USDC or as HYPE, and the better one moves.
-
-Selling into HYPE quotes about 1% above selling into USDC — measured
-2026-11-10, consistently across sizes:
-
-| Size | → USDC | → HYPE (at spot) | HYPE better by |
-| --- | --- | --- | --- |
-| 3,000 KNTQ | $1,024.50 | $1,033.99 | +0.93% |
-| 9,000 KNTQ | $3,070.24 | $3,099.33 | +0.95% |
-| 30,000 KNTQ | $10,213.57 | $10,313.39 | +0.98% |
-
-That gap is not free money. Converting the HYPE straight back to USDC on
-Elysium lands at $3,070.10 — exactly the direct route — because Elysium USDC
-trades under a dollar: everyone leaving sells it cheap. Solvers know that and
-price the HYPE bridge accordingly, handing some or all of the premium back.
-Through Relay the premium vanished entirely; through LI.FI Intents roughly
-half of it survived.
-
-So both carriers are measured end to end, from the same KNTQ quantity to USDC
-actually delivered on the destination chain, and the winner is whichever pays
-more. No HYPE price feed enters that decision, which is what makes it
-trustworthy — a spot mark would quietly decide the answer.
+Every few seconds (`/poll`, default 10 s), for the pinned message's size.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `/spread 2.5%` | Set the alert threshold. Persisted, survives restarts. |
-| `/pulls` | Routes that can take the money out under `MAX_EXIT_LOSS_PCT`, with how much each can absorb. |
-| `/status` | Latest spread, fill price, chosen carrier, best exit. |
-| `/only 2` | Spread watch only, no exit needed. Pushes via Pushover, re-fires every +1%. `/only off` stops it. |
-| `/poll 5` | How often the fast loop checks the spread, 3–120 s. Default 10. |
+| `/status` | Latest KNTQ spread with buy and sell price, and the HYPE block. |
+| `/only 1` | Alert when the KNTQ spread is above 1 % (`/spread 1` is the same). A group message on every +1 %, a Pushover push at most once an hour. `/only off`. |
+| `/pin 5000` | Pinned message with the KNTQ and HYPE spread for $5,000, edited as it moves. `/pin off`. |
+| `/hype` | HYPE spread HL → Elysium. `/hype 1` alert threshold, `/hype off`. |
+| `/whales` | Big KNTQ holders: push when one sells at market. |
+| `/poll 5` | How often the spread is checked, 3–120 s. |
 | `/allow` / `/deny` | Owner only: reply to someone's message to grant or revoke command access. `/myid` shows your id. |
 | `/pushover USER_KEY` | Connect Pushover. The bot deletes the message carrying the key. `/pushover test`, `/pushover off`. |
-
-`/spread` and `/pulls` are limited to `TELEGRAM_ADMIN_ID` when it is set.
 
 ## HYPE spread
 
@@ -81,32 +46,6 @@ uses six, so HYPE gets one quote every third round (about every 30 s).
 It shows in the pinned message and in `/status`; `/hype` prints it. A Pushover
 push and a group message fire above 1 % (`/hype 1.5` changes the threshold,
 `/hype off` stops it), again when the spread climbs another 0.5 %.
-
-## Alerts
-
-**GO** — spread ≥ `GO_SPREAD_PCT` *and* some chain can take the money back out
-at ≤ `MAX_EXIT_LOSS_PCT`. Reports the net after the exit, not the gross.
-
-**URGENT** — spread ≥ `URGENT_SPREAD_PCT`, sent even when every exit is drained,
-because at that spread the six-day canonical withdrawal may be worth eating.
-
-Both are edge-triggered with a hysteresis band (`CLEAR_MARGIN_PCT`) and a
-cooldown, so a spread hovering at the threshold does not produce a stream of
-messages.
-
-## How the numbers are produced
-
-- **Buy price** walks the real ask side of the `@334` order book for the full
-  notional and adds the taker fee. A mid price would hide most of the cost on a
-  two-percent edge.
-- **Sell price** is a KyberSwap quote on Elysium for the exact quantity the walk
-  produced, routed across every pool on the chain.
-- **Exit cost** is a LI.FI quote per destination, with Relay as the fallback.
-
-One caveat on the Hyperliquid info API: `spotMetaAndAssetCtxs` returns `universe`
-and the context array *not* aligned by position — `universe[297]` is pair `@334`
-while `contexts[297].coin` is `@297`. Match on the `coin` field, never the index.
-This service reads `l2Book` directly and sidesteps it.
 
 ## Running it
 
@@ -127,39 +66,14 @@ python tools/get_chat_id.py
 Every variable is documented in `.env.example`. Required: `TELEGRAM_BOT_TOKEN`,
 `TELEGRAM_CHAT_ID`, `REDIS_URL`.
 
-`LIFI_API_KEY` is optional but close to required in practice — the anonymous
-rate limit is low enough that a few minutes of probing will lock you out for an
-hour. Free key at <https://portal.li.fi>.
-
-## Which chains, and how they are probed
-
-38 EVM chains are watched — every one LI.FI lists a USDC for. They are never
-all quoted at once; LI.FI's rate limit does not allow it, and finding out the
-hard way costs an hour's lockout.
-
-Instead each chain's last measured exit cost is kept in Redis, and probes are
-spent in priority order:
-
-1. chains last seen open, cheapest first
-2. chains never measured, or whose reading has gone stale
-3. chains last seen drained
-
-The sweep stops at the **first** open exit, because one working route is all
-the trade needs. In the common case that costs a single request. The budget
-only bites when nothing is open anywhere — which is exactly when searching
-further down the list is worth it.
-
 ## Request budget
 
-Per tick (default 120s): 1 order book + 1 Kyber quote. Exit quotes are spent
-only when the spread is within `CLEAR_MARGIN_PCT` of the trigger, plus one
-background sample every tenth tick. So a quiet market costs ~1,440 calls a day
-and burns no LI.FI quota; a live spread with a working exit costs one LI.FI
-call per tick; a live spread with every chain drained costs up to `PROBES_HOT`.
+Per round: one HyperCore order book and one Kyber quote for KNTQ; HYPE adds one
+of each every third round. Kyber starts refusing at roughly ten requests a
+minute; a 429 pauses all Kyber calls for a few seconds.
 
-Redis: one `HGETALL` at startup, then one pipelined write per 60s flush and only
-when something changed — about 2,900 commands a day worst case, and none at all
-while nothing moves.
+Redis: one read at startup, then one write per flush interval and only when
+something changed.
 
 ## Addresses
 
